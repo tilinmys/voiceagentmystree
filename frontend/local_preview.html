@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MyStree Clinic Voice Agent</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #071013;
+        --panel: rgba(18, 27, 31, 0.92);
+        --line: rgba(255, 255, 255, 0.1);
+        --text: #f5f7f7;
+        --muted: #aab7b8;
+        --mint: #2dd4bf;
+        --rose: #fb7185;
+        --amber: #fbbf24;
+        --violet: #a78bfa;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background:
+          linear-gradient(135deg, rgba(45, 212, 191, 0.13), transparent 34%),
+          radial-gradient(circle at 75% 10%, rgba(167, 139, 250, 0.18), transparent 34%),
+          var(--bg);
+        font-family: Inter, Segoe UI, Arial, sans-serif;
+        color: var(--text);
+      }
+      main {
+        width: min(940px, calc(100vw - 32px));
+        display: grid;
+        grid-template-columns: minmax(300px, 420px) minmax(300px, 1fr);
+        gap: 18px;
+      }
+      section {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+      }
+      .card { padding: 30px; }
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--mint);
+        font-size: 12px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: .08em;
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--mint);
+        box-shadow: 0 0 16px var(--mint);
+      }
+      h1 {
+        margin: 18px 0 10px;
+        font-size: 34px;
+        letter-spacing: 0;
+      }
+      p { color: var(--muted); line-height: 1.55; }
+      button {
+        width: 100%;
+        min-height: 48px;
+        margin-top: 20px;
+        border: 0;
+        border-radius: 8px;
+        background: var(--mint);
+        color: #06211d;
+        font-weight: 800;
+        cursor: pointer;
+      }
+      button:disabled { opacity: .65; cursor: wait; }
+      .status {
+        margin-top: 18px;
+        padding: 14px;
+        border-radius: 8px;
+        background: rgba(255,255,255,.04);
+        border: 1px solid var(--line);
+        color: var(--muted);
+        min-height: 50px;
+      }
+      .ok { color: var(--mint); }
+      .error { color: var(--rose); }
+      .console {
+        padding: 18px;
+        min-height: 360px;
+        display: flex;
+        flex-direction: column;
+      }
+      .console-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 14px;
+      }
+      .console h2 {
+        margin: 0;
+        font-size: 15px;
+      }
+      .copy-log {
+        width: auto;
+        min-height: 32px;
+        margin: 0;
+        padding: 0 12px;
+        border: 1px solid var(--line);
+        background: rgba(255,255,255,.06);
+        color: var(--text);
+        font-size: 12px;
+        font-weight: 800;
+      }
+      .copy-log:hover { background: rgba(255,255,255,.1); }
+      #logs {
+        flex: 1;
+        overflow: auto;
+        border-top: 1px solid var(--line);
+        padding-top: 14px;
+        font: 12px Consolas, monospace;
+        color: #d8dee0;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .log-line {
+        display: grid;
+        grid-template-columns: 70px 118px 1fr;
+        gap: 8px;
+        align-items: start;
+        padding: 8px 10px;
+        border: 1px solid rgba(255,255,255,.08);
+        border-left-width: 4px;
+        border-radius: 8px;
+        background: rgba(255,255,255,.035);
+        white-space: normal;
+      }
+      .stage-ok { border-left-color: var(--mint); }
+      .stage-info { border-left-color: #60a5fa; }
+      .stage-warn { border-left-color: var(--amber); }
+      .stage-error { border-left-color: var(--rose); }
+      .stage-pill {
+        color: #061311;
+        background: var(--mint);
+        border-radius: 999px;
+        padding: 2px 7px;
+        font-size: 10px;
+        font-weight: 800;
+        text-transform: uppercase;
+      }
+      .stage-warn .stage-pill { background: var(--amber); color: #241400; }
+      .stage-error .stage-pill { background: var(--rose); color: #29050b; }
+      .stage-info .stage-pill { background: #60a5fa; color: #051225; }
+      .log-main strong { display: block; color: var(--text); margin-bottom: 3px; }
+      .log-main span { color: var(--muted); }
+      .log-details {
+        grid-column: 3;
+        color: #9db0b2;
+        font-size: 11px;
+        overflow-wrap: anywhere;
+      }
+      .bar {
+        height: 88px;
+        display: flex;
+        align-items: end;
+        gap: 8px;
+        margin: 26px 0;
+      }
+      .bar i {
+        width: 100%;
+        border-radius: 999px 999px 4px 4px;
+        background: linear-gradient(var(--violet), var(--mint));
+        animation: bounce 1.2s infinite ease-in-out;
+      }
+      .bar i:nth-child(2) { animation-delay: .12s; }
+      .bar i:nth-child(3) { animation-delay: .24s; }
+      .bar i:nth-child(4) { animation-delay: .36s; }
+      .bar i:nth-child(5) { animation-delay: .48s; }
+      @keyframes bounce {
+        0%, 100% { height: 22%; }
+        50% { height: 92%; }
+      }
+      @media (max-width: 780px) {
+        main { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="card">
+        <div class="eyebrow"><span class="dot"></span> Voice Call</div>
+        <h1>MyStree Clinic</h1>
+        <p>Tap start, allow microphone access, and speak naturally. This page connects directly to the LiveKit room and plays the agent's voice back here.</p>
+        <div class="bar" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+        <label for="voice" style="display:block;margin:10px 0 4px;font-size:13px;opacity:.85">Agent voice (Sarvam bulbul:v3)</label>
+        <select id="voice" style="width:100%;padding:10px;border-radius:10px;margin-bottom:12px;font-size:14px">
+          <optgroup label="Female voices">
+            <option value="ishita" selected>Ishita (current default)</option>
+            <option value="priya">Priya</option>
+            <option value="neha">Neha</option>
+            <option value="pooja">Pooja</option>
+            <option value="kavya">Kavya</option>
+            <option value="simran">Simran</option>
+            <option value="shreya">Shreya</option>
+            <option value="ritu">Ritu</option>
+            <option value="roopa">Roopa</option>
+            <option value="tanya">Tanya</option>
+            <option value="shruti">Shruti</option>
+            <option value="suhani">Suhani</option>
+            <option value="kavitha">Kavitha</option>
+            <option value="rupali">Rupali</option>
+            <option value="niharika">Niharika</option>
+          </optgroup>
+          <optgroup label="Male voices">
+            <option value="aditya">Aditya</option>
+            <option value="kabir">Kabir</option>
+            <option value="rohan">Rohan</option>
+            <option value="amit">Amit</option>
+          </optgroup>
+        </select>
+        <button id="start">Start Talking to Agent</button>
+        <button id="stop" hidden>End Call</button>
+        <div id="status" class="status">Ready. Click start and allow microphone access.</div>
+      </section>
+      <section class="console">
+        <div class="console-head">
+          <h2>System Logs Console</h2>
+          <button id="copyLogs" class="copy-log" type="button">Copy Logs</button>
+        </div>
+        <div id="logs"></div>
+      </section>
+    </main>
+    <script type="module">
+      import {
+        Room,
+        RoomEvent,
+        Track,
+        createLocalAudioTrack
+      } from "https://cdn.jsdelivr.net/npm/livekit-client@2.20.0/dist/livekit-client.esm.mjs";
+
+      const button = document.getElementById("start");
+      const stopButton = document.getElementById("stop");
+      const copyLogsButton = document.getElementById("copyLogs");
+      const status = document.getElementById("status");
+      const logs = document.getElementById("logs");
+      let room = null;
+      let micTrack = null;
+      let backendCursor = 0;
+      let sessionLogActive = false;
+      const logBuffer = [];
+      const pageStartedAt = performance.now();
+
+      const statusFromError = (error) => (error ? "error" : "ok");
+
+      const compactDetails = (details = {}) => {
+        const keys = Object.keys(details).filter((key) => details[key] !== undefined && details[key] !== null);
+        if (!keys.length) return "";
+        return keys.map((key) => `${key}=${JSON.stringify(details[key])}`).join(" ");
+      };
+
+      const escapeHtml = (value) => String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+
+      const logEvent = ({ stage, status: eventStatus = "info", label, message, details = {} }) => {
+        const stamp = new Date().toLocaleTimeString();
+        logBuffer.push({ stamp, stage, status: eventStatus, label, message, details });
+        const row = document.createElement("div");
+        row.className = `log-line stage-${eventStatus}`;
+        const detailText = compactDetails(details);
+        row.innerHTML = `
+          <span>${stamp}</span>
+          <span class="stage-pill">${escapeHtml(eventStatus)}</span>
+          <div class="log-main"><strong>${escapeHtml(stage || "Stage ?")} | ${escapeHtml(label || "Event")}</strong><span>${escapeHtml(message || "")}</span></div>
+          ${detailText ? `<div class="log-details">${escapeHtml(detailText)}</div>` : ""}
+        `;
+        logs.appendChild(row);
+        logs.scrollTop = logs.scrollHeight;
+      };
+
+      const log = (stage, status, label, message, details = {}) => {
+        logEvent({ stage, status, label, message, details });
+      };
+
+      const clearVisibleLogs = () => {
+        logBuffer.length = 0;
+        logs.innerHTML = "";
+      };
+
+      const formatLogLine = (entry) => {
+        const detailText = compactDetails(entry.details || {});
+        const base = `[${entry.stamp}] ${entry.status.toUpperCase()} ${entry.stage || "Stage ?"} | ${entry.label || "Event"} - ${entry.message || ""}`;
+        return detailText ? `${base} | ${detailText}` : base;
+      };
+
+      copyLogsButton.addEventListener("click", async () => {
+        const text = logBuffer.map(formatLogLine).join("\n");
+        try {
+          await navigator.clipboard.writeText(text);
+          copyLogsButton.textContent = "Copied";
+          log("Stage ? Logs", "ok", "Copied logs", `${logBuffer.length} row(s) copied to clipboard`);
+        } catch (error) {
+          log("Stage ? Logs", "error", "Copy failed", error.message);
+        } finally {
+          setTimeout(() => {
+            copyLogsButton.textContent = "Copy Logs";
+          }, 1400);
+        }
+      });
+
+      const initializeBackendCursor = async () => {
+        try {
+          const response = await fetch("/api/logs?since=latest", { cache: "no-store" });
+          const data = await response.json();
+          backendCursor = data.next ?? 0;
+        } catch (error) {
+          backendCursor = 0;
+        }
+      };
+
+      const pollBackendLogs = async () => {
+        if (!sessionLogActive) return;
+        try {
+          const response = await fetch(`/api/logs?since=${backendCursor}`, { cache: "no-store" });
+          const data = await response.json();
+          backendCursor = data.next ?? backendCursor;
+          for (const event of data.events || []) {
+            logEvent(event);
+          }
+        } catch (error) {
+          log("Stage ? Logs", "warn", "Backend log poll", error.message);
+        }
+      };
+
+      const attachAgentAudio = (track, publication, participant) => {
+        if (track.kind !== Track.Kind.Audio) return;
+        const startedAt = performance.now();
+        const audio = track.attach();
+        audio.autoplay = true;
+        audio.dataset.participant = participant?.identity || "agent";
+        audio.addEventListener("playing", () => {
+          log("Stage 9 Playback", "ok", "Agent audio playing", "Remote audio element started", {
+            participant: participant?.identity || "agent",
+            elapsed_ms: Math.round(performance.now() - startedAt)
+          });
+        }, { once: true });
+        document.body.appendChild(audio);
+        log("Stage 9 Playback", "ok", "Agent audio subscribed", "Remote agent audio track attached", {
+          participant: participant?.identity || "agent",
+          track_sid: publication?.trackSid || null
+        });
+      };
+
+      log("Stage 0 Worker", "info", "Preview loaded", "Localhost voice console is ready", {
+        elapsed_ms: Math.round(performance.now() - pageStartedAt)
+      });
+      initializeBackendCursor();
+      setInterval(pollBackendLogs, 900);
+
+      button.addEventListener("click", async () => {
+        const clickStartedAt = performance.now();
+        sessionLogActive = true;
+        backendCursor = 0;
+        clearVisibleLogs();
+        button.disabled = true;
+        stopButton.hidden = true;
+        status.className = "status";
+        status.textContent = "Connecting to voice room...";
+        log("Stage 1 Auth", "info", "Token request", "Requesting LiveKit access token");
+        try {
+          const tokenStartedAt = performance.now();
+          const selectedVoice = document.getElementById("voice").value;
+          document.getElementById("voice").disabled = true;
+          const response = await fetch(`/api/token?reset_logs=1&voice=${encodeURIComponent(selectedVoice)}`, { cache: "no-store" });
+          const data = await response.json();
+          if (!response.ok || data.error) throw new Error(data.error || "token request failed");
+
+          log("Stage 1 Auth", "ok", "Token generated", `Token generated for ${data.participant}`, {
+            elapsed_ms: Math.round(performance.now() - tokenStartedAt),
+            livekit_url: data.url,
+            voice: data.voice
+          });
+          room = new Room({ adaptiveStream: true, dynacast: true });
+          let agentReadyResolve = null;
+          let agentReady = false;
+          const markAgentReady = (label, participant) => {
+            if (agentReady) return;
+            agentReady = true;
+            log("Stage 4 Worker Dispatch", "ok", label, participant?.identity || "agent");
+            if (agentReadyResolve) agentReadyResolve(true);
+          };
+          room
+            .on(RoomEvent.Connected, () => log("Stage 2 WebRTC", "ok", "Room connected", "Browser connected to LiveKit room", {
+              elapsed_ms: Math.round(performance.now() - clickStartedAt)
+            }))
+            .on(RoomEvent.Disconnected, () => log("Stage 2 WebRTC", "warn", "Room disconnected", "Browser disconnected from LiveKit room"))
+            .on(RoomEvent.ParticipantConnected, (participant) => markAgentReady("Participant joined", participant))
+            .on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
+              markAgentReady("Agent audio track ready", participant);
+              attachAgentAudio(track, publication, participant);
+            })
+            .on(RoomEvent.ConnectionStateChanged, (state) => {
+              const stateStatus = state === "connected" ? "ok" : state === "disconnected" ? "warn" : "info";
+              log("Stage 2 WebRTC", stateStatus, "Connection state", state);
+            });
+
+          const connectStartedAt = performance.now();
+          log("Stage 2 WebRTC", "info", "Room connect", "Connecting browser over LiveKit WebRTC");
+          await room.connect(data.url, data.token);
+          log("Stage 2 WebRTC", "ok", "Room connect complete", "WebRTC connection established", {
+            elapsed_ms: Math.round(performance.now() - connectStartedAt)
+          });
+
+          const dispatchStartedAt = performance.now();
+          log("Stage 4 Worker Dispatch", "info", "Waiting for agent", "Waiting for LiveKit worker to join this room");
+          if (room.remoteParticipants?.size > 0) {
+            const firstAgent = Array.from(room.remoteParticipants.values())[0];
+            markAgentReady("Participant already joined", firstAgent);
+          }
+          await Promise.race([
+            new Promise((resolve) => {
+              agentReadyResolve = resolve;
+              if (agentReady) resolve(true);
+            }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("Agent did not join this room within 12 seconds. Worker may be reconnecting.")), 12000))
+          ]);
+          log("Stage 4 Worker Dispatch", "ok", "Agent ready", "Worker joined room; microphone can start", {
+            elapsed_ms: Math.round(performance.now() - dispatchStartedAt)
+          });
+
+          log("Stage 3 Microphone", "info", "Mic permission", "Requesting microphone permission");
+          const micStartedAt = performance.now();
+          micTrack = await createLocalAudioTrack({
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          });
+          log("Stage 3 Microphone", "ok", "Mic captured", "Local microphone track created", {
+            elapsed_ms: Math.round(performance.now() - micStartedAt)
+          });
+          const publishStartedAt = performance.now();
+          await room.localParticipant.publishTrack(micTrack);
+          log("Stage 3 Microphone", "ok", "Mic published", "Microphone published to LiveKit; speak now", {
+            elapsed_ms: Math.round(performance.now() - publishStartedAt)
+          });
+
+          status.className = "status ok";
+          status.textContent = "Connected. Speak now, the agent should answer here.";
+          button.hidden = true;
+          stopButton.hidden = false;
+        } catch (error) {
+          status.className = "status error";
+          status.textContent = error.message;
+          log("Stage ? Break", statusFromError(error), "Call setup failed", error.message, {
+            elapsed_ms: Math.round(performance.now() - clickStartedAt)
+          });
+          button.hidden = false;
+          stopButton.hidden = true;
+          if (room) room.disconnect();
+        } finally {
+          button.disabled = false;
+          if (button.hidden === false) document.getElementById("voice").disabled = false;
+        }
+      });
+
+      stopButton.addEventListener("click", () => {
+        if (micTrack) {
+          micTrack.stop();
+          micTrack = null;
+        }
+        if (room) {
+          room.disconnect();
+          room = null;
+        }
+        document.querySelectorAll("audio[data-participant]").forEach((audio) => audio.remove());
+        status.className = "status";
+        status.textContent = "Call ended. Pick a voice and click start to talk again.";
+        button.hidden = false;
+        stopButton.hidden = true;
+        document.getElementById("voice").disabled = false;
+        log("Stage 2 WebRTC", "warn", "Call ended", "User ended the call");
+      });
+    </script>
+  </body>
+</html>

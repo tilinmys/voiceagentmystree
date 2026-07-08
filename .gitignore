@@ -26,6 +26,7 @@ data/
 
 # Logs
 *.log
+logs/
 
 # Node.js
 node_modules/

@@ -1,16 +1,92 @@
 import asyncio
 import base64
+import inspect
+import io
 import json
 import logging
+import os
+import uuid
+import wave
+from urllib.parse import urlencode, urlparse
+
+import re
+
 import websockets
-from livekit.agents import stt, tts
-from livekit.agents.utils import AudioBuffer
 from livekit import rtc
+from livekit.agents import APIConnectionError, APIStatusError, stt, tts
+from livekit.agents.types import APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS
+from livekit.agents.utils import AudioBuffer
 
 logger = logging.getLogger("sarvam_wrappers")
 
+# Server message types that mean "all audio for the flushed text has been sent".
+_TTS_COMPLETION_TYPES = {"flush_complete", "flushed", "done", "complete", "end", "eos"}
+_seen_unknown_types: set[str] = set()
+
+# At least one letter or digit (any script) — the minimum Sarvam will accept.
+_SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0900-\u097F]", re.UNICODE)
+
+
+def _redact_url(url: str) -> str:
+    parsed = urlparse(url)
+    return parsed._replace(query="...").geturl() if parsed.query else url
+
+
+def _ws_url(base_url: str, path: str, query: dict[str, str]) -> str:
+    base = base_url.rstrip("/")
+    if base.startswith("https://"):
+        base = "wss://" + base.removeprefix("https://")
+    elif base.startswith("http://"):
+        base = "ws://" + base.removeprefix("http://")
+    return f"{base}{path}?{urlencode(query)}"
+
+
+def _ws_headers(api_key: str) -> dict[str, str]:
+    if not api_key:
+        raise APIStatusError("SARVAM_API_KEY is missing.", status_code=401, retryable=False)
+    return {
+        "api-subscription-key": api_key,
+        "x-api-key": api_key,
+    }
+
+
+def _websocket_connect(uri: str, headers: dict[str, str], *, open_timeout: float | None = None):
+    connect_params = inspect.signature(websockets.connect).parameters
+    header_kw = "additional_headers" if "additional_headers" in connect_params else "extra_headers"
+    kwargs = {header_kw: headers}
+    if open_timeout is not None and "open_timeout" in connect_params:
+        kwargs["open_timeout"] = open_timeout
+    return websockets.connect(uri, **kwargs)
+
+
+def _to_api_error(message: str, exc: Exception) -> APIConnectionError:
+    return APIConnectionError(f"{message}: {type(exc).__name__}: {exc}")
+
+
+def _pcm16_to_wav_bytes(pcm: bytes, *, sample_rate: int, num_channels: int) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(num_channels)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm)
+    return buffer.getvalue()
+
+
+def _strip_wav_header(audio_bytes: bytes) -> bytes:
+    if audio_bytes.startswith(b"RIFF") and len(audio_bytes) > 44:
+        return audio_bytes[44:]
+    return audio_bytes
+
+
 class SarvamSTT(stt.STT):
-    def __init__(self, api_key: str, model: str = "saarika:v2.5", language_code: str = "en-IN"):
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "saarika:v2.5",
+        language_code: str = "en-IN",
+        base_url: str = "https://api.sarvam.ai",
+    ):
         super().__init__(
             capabilities=stt.STTCapabilities(
                 streaming=True,
@@ -20,280 +96,466 @@ class SarvamSTT(stt.STT):
         self._api_key = api_key
         self._model = model
         self._language_code = language_code
+        self._base_url = base_url
 
-    def stream(self, *, language: str = None, conn_options = None) -> "SarvamSpeechStream":
+    def stream(
+        self,
+        *,
+        language: str | None = None,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> "SarvamSpeechStream":
         lang = language or self._language_code
-        return SarvamSpeechStream(self, self._api_key, self._model, lang)
+        return SarvamSpeechStream(self, self._api_key, self._model, lang, self._base_url, conn_options)
 
     async def _recognize_impl(
         self,
         buffer: AudioBuffer,
         *,
         language: str | None = None,
-        conn_options = None,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> stt.SpeechEvent:
         raise NotImplementedError("SarvamSTT only supports streaming STT.")
 
 
 class SarvamSpeechStream(stt.SpeechStream):
-    def __init__(self, stt_instance: SarvamSTT, api_key: str, model: str, language_code: str):
-        super().__init__(stt=stt_instance)
+    # Batch mic audio to ~100ms chunks before shipping to Sarvam; sending every 10ms
+    # frame as its own base64 WAV message floods the socket and hurts latency.
+    _SEND_CHUNK_BYTES = 3200  # 100ms @ 16kHz mono s16le
+
+    def __init__(
+        self,
+        stt_instance: SarvamSTT,
+        api_key: str,
+        model: str,
+        language_code: str,
+        base_url: str,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ):
+        super().__init__(stt=stt_instance, conn_options=conn_options)
         self._api_key = api_key
         self._model = model
         self._language_code = language_code
-        self._ws = None
+        self._base_url = base_url
 
     async def _run(self) -> None:
-        uri = f"wss://api.sarvam.ai/speech-to-text/ws?language-code={self._language_code}&model={self._model}"
-        headers = {
-            "api-subscription-key": self._api_key
-        }
-        resampler = None
+        uri = _ws_url(
+            self._base_url,
+            "/speech-to-text/ws",
+            {"language-code": self._language_code, "model": self._model},
+        )
+        headers = _ws_headers(self._api_key)
+        resampler: rtc.AudioResampler | None = None
+        resampler_rate: int | None = None
+        pending = bytearray()
 
         try:
-            logger.info(f"Connecting to Sarvam STT WebSocket: {uri}")
-            async with websockets.connect(uri, extra_headers=headers) as websocket:
-                self._ws = websocket
-
-                # Send initial configuration message
+            logger.info("Connecting to Sarvam STT WebSocket: %s", _redact_url(uri))
+            async with _websocket_connect(uri, headers) as websocket:
                 config_msg = {
                     "type": "config",
                     "data": {
                         "model": self._model,
                         "mode": "transcribe",
-                        "language_code": self._language_code
-                    }
+                        "language_code": self._language_code,
+                    },
                 }
                 await websocket.send(json.dumps(config_msg))
 
                 async def receive_loop():
-                    try:
-                        async for message in websocket:
-                            resp = json.loads(message)
-                            transcript = ""
-                            is_final = False
+                    async for message in websocket:
+                        resp = json.loads(message)
+                        logger.debug("Sarvam STT received: %s", resp)
 
-                            logger.debug(f"Sarvam STT received: {resp}")
+                        if resp.get("type") in {"error", "ERROR"} or "error" in resp:
+                            raise APIStatusError(
+                                "Sarvam STT rejected the stream.",
+                                status_code=-1,
+                                body=resp,
+                                retryable=False,
+                            )
 
-                            if "transcript" in resp:
-                                transcript = resp["transcript"]
-                                is_final = resp.get("is_final", False)
-                            elif "data" in resp and isinstance(resp["data"], dict) and "transcript" in resp["data"]:
-                                transcript = resp["data"]["transcript"]
-                                is_final = resp["data"].get("is_final", False)
+                        transcript = ""
+                        is_final = False
+                        if "transcript" in resp:
+                            transcript = resp["transcript"]
+                            is_final = resp.get("is_final", False)
+                        elif "data" in resp and isinstance(resp["data"], dict) and "transcript" in resp["data"]:
+                            transcript = resp["data"]["transcript"]
+                            is_final = resp["data"].get("is_final", False)
 
-                            if transcript:
-                                event_type = (
-                                    stt.SpeechEventType.FINAL_TRANSCRIPT
-                                    if is_final
-                                    else stt.SpeechEventType.INTERIM_TRANSCRIPT
+                        if transcript:
+                            event_type = (
+                                stt.SpeechEventType.FINAL_TRANSCRIPT
+                                if is_final
+                                else stt.SpeechEventType.INTERIM_TRANSCRIPT
+                            )
+                            self._event_ch.send_nowait(
+                                stt.SpeechEvent(
+                                    type=event_type,
+                                    alternatives=[
+                                        stt.SpeechData(
+                                            text=transcript,
+                                            language=self._language_code,
+                                            confidence=0.99,
+                                        )
+                                    ],
                                 )
-                                self._event_ch.send_nowait(
-                                    stt.SpeechEvent(
-                                        type=event_type,
-                                        alternatives=[
-                                            stt.SpeechData(
-                                                text=transcript,
-                                                language=self._language_code,
-                                                confidence=0.99
-                                            )
-                                        ]
-                                    )
-                                )
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception as e:
-                        logger.error(f"Error in Sarvam STT receive_loop: {e}")
+                            )
+
+                async def send_pending(force: bool = False):
+                    nonlocal pending
+                    if not pending or (not force and len(pending) < self._SEND_CHUNK_BYTES):
+                        return
+                    wav_bytes = _pcm16_to_wav_bytes(bytes(pending), sample_rate=16000, num_channels=1)
+                    pending = bytearray()
+                    audio_msg = {
+                        "type": "audio",
+                        "audio": {
+                            "data": base64.b64encode(wav_bytes).decode("ascii"),
+                            "encoding": "audio/wav",
+                            "sample_rate": 16000,
+                        },
+                    }
+                    await websocket.send(json.dumps(audio_msg))
 
                 recv_task = asyncio.create_task(receive_loop())
 
                 try:
-                    async for frame in self._audio_ch:
-                        if self._ws is None:
-                            break
+                    async for item in self._input_ch:
+                        if recv_task.done():
+                            recv_task.result()
 
-                        # Initialize or update resampler
-                        if resampler is None or resampler.input_rate != frame.sample_rate or resampler.num_channels != frame.num_channels:
+                        if isinstance(item, self._FlushSentinel):
+                            await send_pending(force=True)
+                            continue
+
+                        frame = item
+                        if resampler is None or resampler_rate != frame.sample_rate:
+                            resampler_rate = frame.sample_rate
                             resampler = rtc.AudioResampler(
                                 input_rate=frame.sample_rate,
                                 output_rate=16000,
-                                num_channels=frame.num_channels
+                                num_channels=frame.num_channels,
                             )
-                            logger.info(f"STT Resampler initialized: {frame.sample_rate}Hz -> 16000Hz, channels: {frame.num_channels}")
+                            logger.info(
+                                "STT Resampler initialized: %sHz -> 16000Hz, channels: %s",
+                                frame.sample_rate,
+                                frame.num_channels,
+                            )
 
-                        resampled_frames = resampler.push(frame)
-                        for r_frame in resampled_frames:
-                            await websocket.send(bytes(r_frame.data))
+                        for r_frame in resampler.push(frame):
+                            pending.extend(bytes(r_frame.data))
+                        await send_pending()
+                    await send_pending(force=True)
                 finally:
                     recv_task.cancel()
-                    await recv_task
+                    try:
+                        await recv_task
+                    except asyncio.CancelledError:
+                        pass
+        except (APIConnectionError, APIStatusError):
+            raise
         except Exception as e:
-            logger.error(f"Error in Sarvam STT stream _run: {e}")
-        finally:
-            self._ws = None
+            logger.error("Error in Sarvam STT stream _run", exc_info=True)
+            raise _to_api_error("Sarvam STT stream failed", e) from e
 
 
 class SarvamTTS(tts.TTS):
-    def __init__(self, api_key: str, model: str = "bulbul:v2", speaker: str = "anushka", target_language_code: str = "en-IN"):
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "bulbul:v3",
+        speaker: str = "ishita",
+        target_language_code: str = "en-IN",
+        base_url: str = "https://api.sarvam.ai",
+        pace: float = 1.05,
+        min_buffer_size: int = 35,
+        max_chunk_length: int = 160,
+        output_audio_codec: str = "wav",
+    ):
         sample_rate = 24000 if "v3" in model else 22050
         super().__init__(
             capabilities=tts.TTSCapabilities(
                 streaming=True,
             ),
             sample_rate=sample_rate,
-            num_channels=1
+            num_channels=1,
         )
         self._api_key = api_key
         self._model = model
         self._speaker = speaker
         self._target_language_code = target_language_code
+        self._base_url = base_url
+        self._pace = pace
+        self._min_buffer_size = min_buffer_size
+        self._max_chunk_length = max_chunk_length
+        self._output_audio_codec = output_audio_codec
 
-    def synthesize(self, text: str) -> "SarvamTTSChunkedStream":
-        return SarvamTTSChunkedStream(
-            tts_instance=self,
-            text=text,
-            api_key=self._api_key,
-            model=self._model,
-            speaker=self._speaker,
-            target_language_code=self._target_language_code
+    @property
+    def ws_open_timeout(self) -> float:
+        return float(os.getenv("SARVAM_TTS_TIMEOUT", "5.0"))
+
+    @property
+    def idle_timeout(self) -> float:
+        # After the final flush, how long to wait with no server message before
+        # considering the segment fully synthesized. Live calls showed Sarvam can
+        # pause >1s between synthesis batches on longer replies — 1.0s truncated
+        # audible words (132 chars -> 3.8s audio), so keep this generous. The tail
+        # wait overlaps playback of already-buffered audio, so callers never hear it.
+        return float(os.getenv("SARVAM_TTS_IDLE_TIMEOUT", "3.0"))
+
+    def config_message(self) -> str:
+        return json.dumps(
+            {
+                "type": "config",
+                "data": {
+                    "target_language_code": self._target_language_code,
+                    "speaker": self._speaker,
+                    "pace": self._pace,
+                    "min_buffer_size": self._min_buffer_size,
+                    "max_chunk_length": self._max_chunk_length,
+                    "output_audio_codec": "wav",
+                },
+            }
         )
 
-    def stream(self) -> "SarvamTTSSynthesizeStream":
-        return SarvamTTSSynthesizeStream(
-            tts_instance=self,
-            api_key=self._api_key,
-            model=self._model,
-            speaker=self._speaker,
-            target_language_code=self._target_language_code
-        )
+    def synthesize(
+        self,
+        text: str,
+        *,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> "SarvamTTSChunkedStream":
+        return SarvamTTSChunkedStream(tts_instance=self, text=text, conn_options=conn_options)
+
+    def stream(
+        self,
+        *,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> "SarvamTTSSynthesizeStream":
+        return SarvamTTSSynthesizeStream(tts_instance=self, conn_options=conn_options)
+
+
+async def _run_sarvam_tts_ws(
+    *,
+    tts_instance: SarvamTTS,
+    output_emitter: tts.AudioEmitter,
+    input_aiter,
+    conn_options: APIConnectOptions,
+    mark_started,
+) -> None:
+    """Shared Sarvam TTS websocket session.
+
+    `input_aiter` yields str tokens to synthesize and None to force a flush.
+    Audio is pushed to `output_emitter` as raw PCM as soon as it arrives.
+    Completes when the input ends AND the server has drained all audio
+    (explicit completion message, socket close, or idle timeout after flush).
+    """
+    uri = _ws_url(tts_instance._base_url, "/text-to-speech/ws", {"model": tts_instance._model})
+    headers = _ws_headers(tts_instance._api_key)
+    open_timeout = min(float(getattr(conn_options, "timeout", 10.0) or 10.0), tts_instance.ws_open_timeout)
+    recv_timeout = float(getattr(conn_options, "timeout", 10.0) or 10.0)
+    idle_timeout = tts_instance.idle_timeout
+
+    logger.info(
+        "Connecting to Sarvam TTS WebSocket: %s speaker=%s language=%s pace=%s",
+        _redact_url(uri),
+        tts_instance._speaker,
+        tts_instance._target_language_code,
+        tts_instance._pace,
+    )
+
+    async with _websocket_connect(uri, headers, open_timeout=open_timeout) as websocket:
+        await websocket.send(tts_instance.config_message())
+
+        input_done = asyncio.Event()
+
+        async def send_loop() -> None:
+            # Sarvam rejects text messages with no letters/digits with a fatal
+            # "400: Text must contain at least one character from the allowed
+            # languages" — so punctuation/whitespace-only tokens are buffered
+            # until they can ride along with speakable text.
+            buffer = ""
+            pending_since_flush = False
+
+            def should_send_buffer(force: bool = False) -> bool:
+                stripped = buffer.strip()
+                if not stripped or not _SPEAKABLE_RE.search(stripped):
+                    return False
+                if force:
+                    return True
+                words = re.findall(r"[A-Za-z0-9\u0900-\u097F]+", stripped)
+                return (
+                    len(stripped) >= 120
+                    or len(words) >= 8
+                    or bool(re.search(r"[.!?।]\s*$", stripped))
+                )
+
+            async def send_buffer(force: bool = False) -> bool:
+                nonlocal buffer, pending_since_flush
+                if not should_send_buffer(force=force):
+                    return False
+                text = buffer.strip()
+                if not text or not _SPEAKABLE_RE.search(text):
+                    buffer = ""
+                    return False
+                mark_started()
+                logger.debug("Sarvam TTS sending text chunk chars=%s text=%r", len(text), text[:160])
+                await websocket.send(json.dumps({"type": "text", "data": {"text": text}}))
+                buffer = ""
+                pending_since_flush = True
+                return True
+
+            try:
+                async for item in input_aiter:
+                    if item is None:
+                        await send_buffer(force=True)
+                        buffer = ""
+                        if pending_since_flush:
+                            await websocket.send(json.dumps({"type": "flush", "data": {}}))
+                            pending_since_flush = False
+                        continue
+                    if not item:
+                        continue
+                    buffer += str(item)
+                    await send_buffer(force=False)
+                await send_buffer(force=True)
+                if pending_since_flush:
+                    await websocket.send(json.dumps({"type": "flush", "data": {}}))
+            finally:
+                input_done.set()
+
+        async def recv_loop() -> None:
+            received_audio = False
+            while True:
+                timeout = idle_timeout if (input_done.is_set() and received_audio) else recv_timeout
+                try:
+                    message = await asyncio.wait_for(websocket.recv(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    if input_done.is_set():
+                        if received_audio:
+                            return  # server went idle after flush: segment complete
+                        raise APIConnectionError("Sarvam TTS produced no audio before timing out.") from None
+                    continue  # input still streaming in; keep waiting
+                except websockets.exceptions.ConnectionClosedOK:
+                    return
+                except websockets.exceptions.ConnectionClosedError as exc:
+                    if received_audio and input_done.is_set():
+                        return
+                    raise _to_api_error("Sarvam TTS websocket closed unexpectedly", exc) from exc
+
+                resp = json.loads(message)
+                rtype = str(resp.get("type", "")).lower()
+                logger.debug("Sarvam TTS received type=%s", rtype)
+
+                if rtype == "error" or "error" in resp:
+                    raise APIStatusError(
+                        "Sarvam TTS rejected the stream.",
+                        status_code=-1,
+                        body=resp,
+                        retryable=False,
+                    )
+
+                if rtype == "audio":
+                    audio_bytes = _strip_wav_header(base64.b64decode(resp["data"]["audio"]))
+                    if audio_bytes:
+                        received_audio = True
+                        output_emitter.push(audio_bytes)
+                elif rtype in _TTS_COMPLETION_TYPES:
+                    if input_done.is_set():
+                        return
+                else:
+                    # Surface unrecognized server events once — if Sarvam sends an
+                    # explicit synthesis-complete event we can key off it instead
+                    # of the idle timeout.
+                    if rtype not in _seen_unknown_types:
+                        _seen_unknown_types.add(rtype)
+                        logger.info("Sarvam TTS unrecognized message type: %s payload=%s", rtype, str(resp)[:300])
+
+        send_task = asyncio.create_task(send_loop())
+        recv_task = asyncio.create_task(recv_loop())
+        try:
+            await asyncio.gather(send_task, recv_task)
+        finally:
+            for task in (send_task, recv_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(send_task, recv_task, return_exceptions=True)
 
 
 class SarvamTTSSynthesizeStream(tts.SynthesizeStream):
-    def __init__(self, tts_instance: SarvamTTS, api_key: str, model: str, speaker: str, target_language_code: str):
-        super().__init__(tts=tts_instance)
-        self._api_key = api_key
-        self._model = model
-        self._speaker = speaker
-        self._target_language_code = target_language_code
-        self._text_queue = asyncio.Queue()
-        self._closed = False
+    """Streaming TTS honoring the LiveKit SynthesizeStream contract.
+
+    Text arrives via the base class `_input_ch` (fed by push_text/flush/end_input);
+    do NOT override those methods — the agent framework relies on them.
+    """
+
+    def __init__(self, *, tts_instance: SarvamTTS, conn_options: APIConnectOptions):
+        super().__init__(tts=tts_instance, conn_options=conn_options)
+        self._sarvam_tts = tts_instance
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
-        uri = f"wss://api.sarvam.ai/text-to-speech/ws?model={self._model}"
-        headers = {
-            "api-subscription-key": self._api_key
-        }
-
-        # bulbul:v3 uses 24000Hz, bulbul:v2 uses 22050Hz
-        sample_rate = 24000 if "v3" in self._model else 22050
-        request_id = "sarvam_tts_" + base64.b64encode(asyncio.current_task().get_name().encode()).decode()[:10]
-
+        request_id = f"sarvam-tts-{uuid.uuid4().hex[:12]}"
         output_emitter.initialize(
             request_id=request_id,
-            sample_rate=sample_rate,
+            sample_rate=self._sarvam_tts.sample_rate,
             num_channels=1,
-            mime_type="audio/pcm"
+            mime_type="audio/pcm",
+            stream=True,
         )
+        output_emitter.start_segment(segment_id=request_id)
+
+        async def _input_aiter():
+            async for item in self._input_ch:
+                if isinstance(item, self._FlushSentinel):
+                    yield None
+                else:
+                    yield item
 
         try:
-            logger.info(f"Connecting to Sarvam TTS WebSocket: {uri}")
-            async with websockets.connect(uri, extra_headers=headers) as websocket:
-                # 1. Send configuration message
-                config_msg = {
-                    "type": "config",
-                    "data": {
-                        "target_language_code": self._target_language_code,
-                        "speaker": self._speaker
-                    }
-                }
-                await websocket.send(json.dumps(config_msg))
-
-                # 2. Start receiver loop in background
-                async def receive_loop():
-                    first_chunk = True
-                    try:
-                        async for message in websocket:
-                            resp = json.loads(message)
-                            if resp.get("type") == "audio":
-                                audio_b64 = resp["data"]["audio"]
-                                audio_bytes = base64.b64decode(audio_b64)
-
-                                # Strip WAV header if present in the first chunk
-                                if first_chunk:
-                                    first_chunk = False
-                                    if audio_bytes.startswith(b"RIFF"):
-                                        audio_bytes = audio_bytes[44:]
-                                        logger.info("Stripped 44-byte WAV header from first TTS chunk")
-
-                                if audio_bytes:
-                                    frame = rtc.AudioFrame(
-                                        data=audio_bytes,
-                                        sample_rate=sample_rate,
-                                        num_channels=1,
-                                        samples_per_channel=len(audio_bytes) // 2
-                                    )
-                                    output_emitter.push(tts.SynthesizedAudio(
-                                        frame=frame,
-                                        request_id=request_id
-                                    ))
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception as e:
-                        logger.error(f"Error in Sarvam TTS receive_loop: {e}")
-
-                recv_task = asyncio.create_task(receive_loop())
-
-                try:
-                    # 3. Read text from queue and send to WebSocket
-                    while True:
-                        item = await self._text_queue.get()
-                        self._text_queue.task_done()
-
-                        if item is None:  # EOF
-                            flush_msg = {"type": "flush"}
-                            await websocket.send(json.dumps(flush_msg))
-                            break
-
-                        text_msg = {
-                            "type": "text",
-                            "data": {
-                                "text": item
-                            }
-                        }
-                        await websocket.send(json.dumps(text_msg))
-
-                    # Wait briefly for final chunks to arrive
-                    await asyncio.sleep(2.0)
-                finally:
-                    recv_task.cancel()
-                    await recv_task
+            await _run_sarvam_tts_ws(
+                tts_instance=self._sarvam_tts,
+                output_emitter=output_emitter,
+                input_aiter=_input_aiter(),
+                conn_options=self._conn_options,
+                mark_started=self._mark_started,
+            )
+            output_emitter.end_segment()
+        except (APIConnectionError, APIStatusError):
+            raise
         except Exception as e:
-            logger.error(f"Error in Sarvam TTS stream _run: {e}")
-
-    def push_text(self, text: str) -> None:
-        if self._closed:
-            raise RuntimeError("stream is closed")
-        self._text_queue.put_nowait(text)
-
-    def flush(self) -> None:
-        pass
-
-    def close(self) -> None:
-        if not self._closed:
-            self._closed = True
-            self._text_queue.put_nowait(None)
+            logger.error("Error in Sarvam TTS stream _run", exc_info=True)
+            raise _to_api_error("Sarvam TTS stream failed", e) from e
 
 
 class SarvamTTSChunkedStream(tts.ChunkedStream):
-    def __init__(self, tts_instance: SarvamTTS, text: str, api_key: str, model: str, speaker: str, target_language_code: str):
-        super().__init__(tts=tts_instance, input_text=text, conn_options=None)
-        self._api_key = api_key
-        self._model = model
-        self._speaker = speaker
-        self._target_language_code = target_language_code
+    def __init__(self, *, tts_instance: SarvamTTS, text: str, conn_options: APIConnectOptions):
+        super().__init__(tts=tts_instance, input_text=text, conn_options=conn_options)
+        self._sarvam_tts = tts_instance
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
-        stream = SarvamTTSSynthesizeStream(self._tts, self._api_key, self._model, self._speaker, self._target_language_code)
-        stream.push_text(self._input_text)
-        stream.close()
-        await stream._run(output_emitter)
+        request_id = f"sarvam-tts-{uuid.uuid4().hex[:12]}"
+        output_emitter.initialize(
+            request_id=request_id,
+            sample_rate=self._sarvam_tts.sample_rate,
+            num_channels=1,
+            mime_type="audio/pcm",
+        )
+
+        async def _input_aiter():
+            yield self._input_text
+            yield None
+
+        try:
+            await _run_sarvam_tts_ws(
+                tts_instance=self._sarvam_tts,
+                output_emitter=output_emitter,
+                input_aiter=_input_aiter(),
+                conn_options=self._conn_options,
+                mark_started=lambda: None,
+            )
+            output_emitter.flush()
+        except (APIConnectionError, APIStatusError):
+            raise
+        except Exception as e:
+            logger.error("Error in Sarvam TTS chunked _run", exc_info=True)
+            raise _to_api_error("Sarvam TTS synthesis failed", e) from e

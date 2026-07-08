@@ -2,7 +2,12 @@ import { AccessToken } from "livekit-server-sdk";
 import { NextRequest, NextResponse } from "next/server";
 
 export async function GET(req: NextRequest) {
-  const room = req.nextUrl.searchParams.get("room") || "mystree-room";
+  // A unique room per call guarantees a fresh agent job is dispatched every time.
+  // Reusing a fixed room name meant a second call could join a stale room whose
+  // agent had already greeted (or was shutting down), producing a silent call.
+  const room =
+    req.nextUrl.searchParams.get("room") ||
+    `mystree-room-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const participant = `clinic-user-${Math.random().toString(36).substring(2, 8)}`;
 
   const apiKey = process.env.LIVEKIT_API_KEY;
