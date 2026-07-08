@@ -1,4 +1,5 @@
 import { AccessToken } from "livekit-server-sdk";
+import { randomUUID } from "crypto";
 import { NextRequest, NextResponse } from "next/server";
 
 export async function GET(req: NextRequest) {
@@ -7,8 +8,8 @@ export async function GET(req: NextRequest) {
   // agent had already greeted (or was shutting down), producing a silent call.
   const room =
     req.nextUrl.searchParams.get("room") ||
-    `mystree-room-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  const participant = `clinic-user-${Math.random().toString(36).substring(2, 8)}`;
+    `mystree-room-${Date.now().toString(36)}-${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+  const participant = `clinic-user-${randomUUID().replace(/-/g, "").slice(0, 12)}`;
 
   const apiKey = process.env.LIVEKIT_API_KEY;
   const apiSecret = process.env.LIVEKIT_API_SECRET;
