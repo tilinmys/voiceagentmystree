@@ -19,10 +19,16 @@ reads to the Railway worker over the public internet.
 
 ## Railway (the worker)
 
-Deploy this whole repo. Start command: `python agent.py dev` for testing, or
-`python agent.py start` for production (check `python agent.py --help` for
-the exact production subcommand your installed `livekit-agents` version
-uses).
+Deploy this whole repo. `railway.json` and `Procfile` both set the start
+command to `python agent.py start` (Railway's Railpack builder can't guess a
+start command for a plain script that isn't `main.py`/`app.py` or a known
+framework - without one it fails at "No start command detected"). Verified
+locally: `dev` and `start` are both real subcommands of the livekit-agents
+CLI (`console`/`start`/`dev`/`connect`/`download-files`) - `start` is the
+production one (structured JSON logs, no dev-mode extras); confirmed it
+registers with LiveKit Cloud correctly and status_server.py's health check
+parses its JSON-formatted "registered worker" line the same as dev mode's
+plain-text one.
 
 Give Railway **every key currently in your local `.env`** — the full set
 `agent.py` reads: `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`,
