@@ -85,6 +85,26 @@ def main() -> None:
     found = db_helper.get_patient_by_phone("98765 43210")
     check("lookup works with unformatted spoken number", bool(found and found["name"] == "Tilin Bijoy"))
 
+    # --- same-call reschedule: atomic slot swap ---
+    open_now = db_helper.get_open_slots()
+    a = open_now[0]
+    b = next(s for s in open_now[1:] if (s["slot_date"], s["slot_time"]) != (a["slot_date"], a["slot_time"]))
+    appt, _ = db_helper.book_slot(1, a["doctor_name"], a["slot_date"], a["slot_time"])
+    check("reschedule setup: booked", appt is not None)
+    ok, why = db_helper.reschedule_appointment(appt, b["slot_date"], b["slot_time"], b["doctor_name"])
+    check("reschedule succeeds", ok, f"(reason={why})")
+    opens = {(s["doctor_name"], s["slot_date"], s["slot_time"]) for s in db_helper.get_open_slots()}
+    check("old slot freed after reschedule", (a["doctor_name"], a["slot_date"], a["slot_time"]) in opens)
+    check("new slot taken after reschedule", (b["doctor_name"], b["slot_date"], b["slot_time"]) not in opens)
+    # reschedule into a TAKEN slot must fail and leave the booking unchanged
+    c_slot = next(s for s in db_helper.get_open_slots() if (s["slot_date"], s["slot_time"]) != (b["slot_date"], b["slot_time"]))
+    blocker, _ = db_helper.book_slot(2, c_slot["doctor_name"], c_slot["slot_date"], c_slot["slot_time"])
+    ok2, why2 = db_helper.reschedule_appointment(appt, c_slot["slot_date"], c_slot["slot_time"], c_slot["doctor_name"])
+    check("reschedule into taken slot rejected", not ok2 and why2 == "taken", f"(reason={why2})")
+    opens2 = {(s["doctor_name"], s["slot_date"], s["slot_time"]) for s in db_helper.get_open_slots()}
+    check("failed reschedule keeps current slot booked", (b["doctor_name"], b["slot_date"], b["slot_time"]) not in opens2)
+    check("cleanup", db_helper.cancel_appointment(appt) and db_helper.cancel_appointment(blocker))
+
     # --- Sunday closure ---
     check("Sunday detected as closed", not db_helper.is_clinic_open("2026-07-12"))
     check("Monday detected as open", db_helper.is_clinic_open("2026-07-13"))

@@ -5,6 +5,31 @@ Companion docs: [CALL_FLOW.md](CALL_FLOW.md) (conversation wireframe), [LATENCY_
 
 ---
 
+## -1. 2026-07-10 — Multi-provider TTS selection (Sarvam / ElevenLabs / Smallest.ai)
+
+- **New**: [voice_catalog.py](voice_catalog.py) is the single source of truth for TTS provider/voice catalogs, shared by `agent.py` and `frontend/local_server.py`. Curated (not auto-fetched) shortlists: 14 Sarvam speakers, 12 ElevenLabs Indian voices (from ElevenLabs' 807-voice shared library, filtered `accent=indian, use_case=conversational`), 12 Smallest.ai Indian voices (from their 108-voice Indian catalog).
+- **New**: [smallest_wrappers.py](smallest_wrappers.py) — `SmallestTTS(tts.TTS)`, a from-scratch wrapper for smallest.ai's `lightning-v3.1/get_speech` REST endpoint (no official livekit plugin exists). Verified live: the endpoint returns headerless 16-bit PCM mono regardless of the `Content-Type: audio/wav` header it sends, and ignores `add_wav_header`; we always pass `sample_rate` explicitly and treat the response as raw PCM to remove the ambiguity. Non-streaming-input (`synthesize()` → `ChunkedStream`, one HTTP call per sentence) — deliberately simpler than a hand-rolled websocket protocol, following the same reasoning as the OpenAI TTS plugin's `AudioChunkedStream`.
+- **New**: `livekit-plugins-elevenlabs==1.6.4` installed and wired — uses the official plugin's native websocket streaming, no custom wrapper needed.
+- **Changed**: `build_tts(tts_provider, voice_id)` now branches to Sarvam/ElevenLabs/Smallest, each fully isolated — still zero `FallbackAdapter` between providers (a mid-call provider switch changes the voice mid-sentence, worse than a same-provider retry). The provider is chosen once per call from dispatch/participant metadata (`tts_provider` + `voice_id` keys) and stays fixed for the whole call.
+- **Changed**: `voice_from_metadata()` → `provider_and_voice_from_metadata()`; validates Sarvam voices against the full `SARVAM_V3_SPEAKERS` set (not just the curated shortlist) and ElevenLabs/Smallest against `voice_catalog.py`. Falls back silently to Sarvam/default on anything unrecognized — never crashes provider construction.
+- **Changed**: the pre-rendered greeting WAV cache (`assets/audio/greetings/`) is Sarvam-only infrastructure; gated so ElevenLabs/Smallest calls always use the live TTS path for the greeting instead of trying (and failing) to build a `SarvamTTS` cache writer with a foreign voice ID.
+- **New UI**: `frontend/local_preview.html` — replaced the static Sarvam-only voice dropdown (with a half-wired, `disabled` ElevenLabs optgroup) with a Provider dropdown + a Voice dropdown populated live from a new `/api/tts-catalog` endpoint in `local_server.py`. Selection flows through `/api/token?provider=...&voice=...` into dispatch/participant metadata, same mechanism as the old Sarvam-only override.
+- **New**: `scripts/tts_benchmark.py` (replaces the stale Sarvam-vs-60db benchmark — 60db was already removed from the runtime chain) — hits every curated voice directly via HTTP, measures TTFB/total latency, writes `logs/tts_benchmark_report.md` + `logs/tts_benchmark_results.json`.
+- **Finding (blocking)**: every one of the 12 curated ElevenLabs voices returns `HTTP 402 "Free users cannot use library voices via the API. Please upgrade your subscription"` — including the one voice already saved to the account's own library. This is a plan restriction, not a code bug: the ElevenLabs code path is correct and will work as soon as the account is upgraded to Creator tier or above. Selecting "elevenlabs" in the UI today will make the call fail when the agent tries to speak.
+- **Finding (fastest verified option)**: Smallest.ai's `maithili` voice — 1371ms TTFB / 1530ms total over plain HTTP (no websocket optimization attempted yet). Full ranked table in `logs/tts_benchmark_report.md`.
+- **Recurring gotcha**: `.env` keeps getting re-saved with a UTF-8 BOM by some Windows editor, which silently corrupts the first key (`LIVEKIT_URL` becomes `﻿LIVEKIT_URL` and the worker crashes with `ValueError: ws_url is required`). Stripped twice this session. If the worker won't start and the error is exactly that, check `.env`'s first three bytes for `EF BB BF` before looking anywhere else.
+
+## 0. 2026-07-09 — Single-provider pipeline, EOU watchdog removal
+
+- **STT**: `build_stt()` now returns `LockedAssemblyAISTT` directly — no `FallbackAdapter`, no Deepgram. A provider switch mid-call costs a multi-second stall; the AssemblyAI `key_terms`/`prompt` bias already covers our clinic vocabulary well enough that riding out a transient hiccup beats a jarring provider swap.
+- **TTS**: `build_tts()` now returns `SarvamTTS` directly — no `FallbackAdapter`, no OpenAI TTS, no 60db, no KittenTTS. `_provider_slug()`/`_attach_tts_fallback_logging()` (only meaningful for a multi-provider chain) deleted. Streaming path unchanged: token-by-token via `TTS.stream()`.
+- **LLM**: `build_llm()` keeps OpenAI `gpt-4o-mini` primary, `llm.FallbackAdapter` with Gemini 2.5 Flash as the sole fast-failing fallback (`attempt_timeout=2.5s`). Groq removed (past 429 rate-limit stalls). Anthropic Haiku was the user's first choice but `livekit-plugins-anthropic` isn't installed and no `ANTHROPIC_API_KEY` is configured in this environment — substituted Gemini, which is already wired via `livekit.plugins.google` with `GOOGLE_API_KEY` present.
+- **EOU**: removed the custom `_force_reply_if_eou_stalls` watchdog and its `turn_watch` bookkeeping entirely. EOU is now solely owned by `MultilingualModel` (`livekit-agents-turn-detector`), assigned as `turn_detection` in `build_turn_handling()`. `MIN_ENDPOINTING_DELAY` default lowered 0.12s → 0.3s. `preemptive_generation` was already `True` by default — confirmed, no change needed.
+- **DB tools**: audited `say_progress()`/`run_db_step()` — already non-blocking (`asyncio.to_thread` wrapping sync `db_helper` calls) with an immediate filler phrase spoken before every lookup. No changes needed.
+- **Bug found while restarting for this change**: `.env` had a UTF-8 BOM on its first line, corrupting the `LIVEKIT_URL` key (parsed as `﻿LIVEKIT_URL`) and crashing the worker with `ValueError: ws_url is required`. Stripped the BOM; this was a pre-existing latent bug unrelated to the code changes above.
+
+---
+
 ## 1. Core reliability fixes (root causes of silent / delayed calls)
 
 | Bug | Root cause | Fix |
@@ -115,3 +140,18 @@ Seeded with concern-keyword routing (longest match wins; default → Dr. Surbhi 
 - **Cold start**: first call after a worker restart takes ~6s to first audio (job-process prewarm, mostly KittenTTS). Warm calls ~3–4.5s. `KITTEN_TTS_ENABLED=false` cuts cold start to ~2s at the cost of the local fallback voice.
 - **Supabase migration**: swap `db_helper.py` internals; atomic claim → Postgres `UPDATE … RETURNING`.
 - **Dev-machine caveat**: if calls go fully silent (no agent joins), the worker's cloud connection may have gone half-open after a network blip — restart `agent.py dev`.
+
+## 2026-07-09 — Production hardening (go-live build)
+
+- **New Sarvam API key** installed and verified live (TTS + STT round-trip).
+- **Sarvam STT is now primary** (saarika:v2.5 streaming) with Deepgram as the single fallback; `STT_PROVIDER=assemblyai` reverts without code change.
+- **Critical deafness bug found & fixed**: Sarvam STT goes silent (no error, no transcripts) when given a language hint it doesn't know — and the agent framework passes hints like `en`. The wrapper now sanitizes every hint to a valid Sarvam code. Verified: `None` / `en` / `multi` / `NOT_GIVEN` all transcribe.
+- Also fixed: Sarvam STT `type:"data"` segment messages (post server-VAD) are now treated as FINAL transcripts — previously only interims were emitted and turns never completed.
+- **LLM: OpenAI gpt-4o-mini only, zero fallback chain** — no mid-call model switches. Groq and Gemini removed from the chain.
+- **TTS chain: Sarvam → OpenAI (single fallback)** — KittenTTS and Cartesia removed.
+- **Singleton locks**: agent worker binds a localhost mutex port (47821) and refuses duplicate launches (verified); preview server disallows Windows double-bind on port 3000. Ends the duplicate-process silent-call plague permanently.
+- **Same-call cancellation & time change**: new `reschedule_appointment` tool backed by a single-transaction atomic slot swap (claim new → free old → move appointment). Tested: success, taken-slot rejection with the original booking untouched, plus 4 more cases — full suite 37/37 green.
+- **Nearest/earliest slot lookups** now use `heapq.nsmallest` (one O(n) scan, k-sized heap).
+- **Live pipeline monitor** added to the preview UI (STT / Turn / LLM / TTS / Tools tiles with providers, latencies, fallback alerts) and the log console now scrolls inside its panel.
+- **Worker health-gated tokens**: `/api/token` returns 503 while the worker is reconnecting instead of creating silent rooms; worker output is wired to `logs/worker_background.log` for the health check.
+- **Spoken end-to-end gate PASSED**: synthetic caller spoke into the room; live session log shows `Transcript final - "I want to make a new booking please."` via Sarvam STT and the agent replied in Sarvam Ishita voice.

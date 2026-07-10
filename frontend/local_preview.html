@@ -87,6 +87,13 @@
         color: var(--muted);
         min-height: 50px;
       }
+      .voice-note {
+        margin: -4px 0 10px;
+        min-height: 18px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.35;
+      }
       .ok { color: var(--mint); }
       .error { color: var(--rose); }
       .console {
@@ -120,7 +127,10 @@
       .copy-log:hover { background: rgba(255,255,255,.1); }
       #logs {
         flex: 1;
-        overflow: auto;
+        /* Scroll INSIDE the console instead of growing the page */
+        height: min(48vh, 460px);
+        max-height: min(48vh, 460px);
+        overflow-y: auto;
         border-top: 1px solid var(--line);
         padding-top: 14px;
         font: 12px Consolas, monospace;
@@ -129,6 +139,29 @@
         flex-direction: column;
         gap: 8px;
       }
+      /* Live pipeline monitor */
+      .monitor {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 8px;
+        margin-bottom: 12px;
+      }
+      .mtile {
+        border: 1px solid rgba(255,255,255,.10);
+        border-left-width: 4px;
+        border-radius: 10px;
+        padding: 8px 10px;
+        background: rgba(255,255,255,.035);
+        min-width: 0;
+      }
+      .mtile .mname { font-size: 10px; letter-spacing: .08em; opacity: .65; text-transform: uppercase; }
+      .mtile .mval  { font-size: 13px; font-weight: 800; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .mtile .msub  { font-size: 11px; opacity: .8; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .mtile.m-ok    { border-left-color: #35d0a5; }
+      .mtile.m-warn  { border-left-color: #e8c34b; }
+      .mtile.m-error { border-left-color: #f26d7d; }
+      .mtile.m-idle  { border-left-color: rgba(255,255,255,.25); }
+      @media (max-width: 900px) { .monitor { grid-template-columns: repeat(2, 1fr); } }
       .log-line {
         display: grid;
         grid-template-columns: 70px 118px 1fr;
@@ -198,32 +231,15 @@
         <h1>MyStree Clinic</h1>
         <p>Tap start, allow microphone access, and speak naturally. This page connects directly to the LiveKit room and plays the agent's voice back here.</p>
         <div class="bar" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
-        <label for="voice" style="display:block;margin:10px 0 4px;font-size:13px;opacity:.85">Agent voice (Sarvam bulbul:v3)</label>
-        <select id="voice" style="width:100%;padding:10px;border-radius:10px;margin-bottom:12px;font-size:14px">
-          <optgroup label="Female voices">
-            <option value="ishita" selected>Ishita (current default)</option>
-            <option value="priya">Priya</option>
-            <option value="neha">Neha</option>
-            <option value="pooja">Pooja</option>
-            <option value="kavya">Kavya</option>
-            <option value="simran">Simran</option>
-            <option value="shreya">Shreya</option>
-            <option value="ritu">Ritu</option>
-            <option value="roopa">Roopa</option>
-            <option value="tanya">Tanya</option>
-            <option value="shruti">Shruti</option>
-            <option value="suhani">Suhani</option>
-            <option value="kavitha">Kavitha</option>
-            <option value="rupali">Rupali</option>
-            <option value="niharika">Niharika</option>
-          </optgroup>
-          <optgroup label="Male voices">
-            <option value="aditya">Aditya</option>
-            <option value="kabir">Kabir</option>
-            <option value="rohan">Rohan</option>
-            <option value="amit">Amit</option>
-          </optgroup>
+        <label for="provider" style="display:block;margin:10px 0 4px;font-size:13px;opacity:.85">TTS provider</label>
+        <select id="provider" style="width:100%;padding:10px;border-radius:10px;margin-bottom:10px;font-size:14px">
+          <option value="sarvam">Sarvam Bulbul V3</option>
+          <option value="rumik">Rumik Silk</option>
+          <option value="smallest" selected>Smallest.ai (Maithili - default)</option>
         </select>
+        <label for="voice" style="display:block;margin:10px 0 4px;font-size:13px;opacity:.85">Voice</label>
+        <select id="voice" style="width:100%;padding:10px;border-radius:10px;margin-bottom:12px;font-size:14px"></select>
+        <div id="voiceNote" class="voice-note">Loading voice catalog...</div>
         <button id="start">Start Talking to Agent</button>
         <button id="stop" hidden>End Call</button>
         <div id="status" class="status">Ready. Click start and allow microphone access.</div>
@@ -232,6 +248,13 @@
         <div class="console-head">
           <h2>System Logs Console</h2>
           <button id="copyLogs" class="copy-log" type="button">Copy Logs</button>
+        </div>
+        <div class="monitor" id="monitor">
+          <div class="mtile m-idle" id="m-stt"><div class="mname">STT</div><div class="mval">idle</div><div class="msub">&nbsp;</div></div>
+          <div class="mtile m-idle" id="m-turn"><div class="mname">Turn / EOU</div><div class="mval">idle</div><div class="msub">&nbsp;</div></div>
+          <div class="mtile m-idle" id="m-llm"><div class="mname">LLM</div><div class="mval">idle</div><div class="msub">&nbsp;</div></div>
+          <div class="mtile m-idle" id="m-tts"><div class="mname">TTS</div><div class="mval">idle</div><div class="msub">&nbsp;</div></div>
+          <div class="mtile m-idle" id="m-tools"><div class="mname">Tools / DB</div><div class="mval">idle</div><div class="msub">&nbsp;</div></div>
         </div>
         <div id="logs"></div>
       </section>
@@ -249,11 +272,16 @@
       const copyLogsButton = document.getElementById("copyLogs");
       const status = document.getElementById("status");
       const logs = document.getElementById("logs");
+      const providerSelect = document.getElementById("provider");
+      const voiceSelect = document.getElementById("voice");
+      const voiceNote = document.getElementById("voiceNote");
+      let ttsCatalog = null;
       let room = null;
       let micTrack = null;
       let backendCursor = 0;
       let sessionLogActive = false;
       const logBuffer = [];
+      const seenBackendEvents = new Set();
       const pageStartedAt = performance.now();
 
       const statusFromError = (error) => (error ? "error" : "ok");
@@ -271,7 +299,9 @@
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#039;");
 
+
       const logEvent = ({ stage, status: eventStatus = "info", label, message, details = {} }) => {
+        updateMonitor({ stage, status: eventStatus, label, message, details });
         const stamp = new Date().toLocaleTimeString();
         logBuffer.push({ stamp, stage, status: eventStatus, label, message, details });
         const row = document.createElement("div");
@@ -290,6 +320,133 @@
       const log = (stage, status, label, message, details = {}) => {
         logEvent({ stage, status, label, message, details });
       };
+
+      const PROVIDER_LABELS = { sarvam: "Sarvam Bulbul V3", rumik: "Rumik Silk", smallest: "Smallest.ai" };
+
+      const renderVoiceOptions = (provider) => {
+        const entry = ttsCatalog?.[provider];
+        voiceSelect.innerHTML = "";
+        if (!entry || !entry.voices?.length) {
+          voiceNote.textContent = `No voices available for ${PROVIDER_LABELS[provider] || provider} right now.`;
+          return;
+        }
+        if (entry.available === false) {
+          voiceSelect.disabled = true;
+          button.disabled = true;
+          voiceNote.textContent = `${PROVIDER_LABELS[provider] || provider} is unavailable - ${entry.unavailable_reason || "check configuration"}`;
+          voiceNote.style.color = "#c0392b";
+          return;
+        }
+        voiceSelect.disabled = false;
+        button.disabled = false;
+        voiceNote.style.color = "";
+        for (const voice of entry.voices) {
+          const option = document.createElement("option");
+          option.value = voice.voice_id;
+          const meta = [voice.gender, voice.style].filter(Boolean).join(", ");
+          option.textContent = `${voice.name}${meta ? ` (${meta})` : ""}`;
+          if (voice.voice_id === entry.default) option.selected = true;
+          voiceSelect.appendChild(option);
+        }
+        voiceNote.textContent = `${entry.voices.length} curated ${PROVIDER_LABELS[provider] || provider} voice(s). Switching provider changes both the engine and the voice heard on the call.`;
+      };
+
+      const loadTtsCatalog = async () => {
+        try {
+          const response = await fetch("/api/tts-catalog", { cache: "no-store" });
+          ttsCatalog = await response.json();
+          for (const option of providerSelect.options) {
+            const entry = ttsCatalog[option.value];
+            if (entry && entry.available === false) {
+              option.disabled = true;
+              option.textContent = `${PROVIDER_LABELS[option.value] || option.value} (unavailable)`;
+            }
+          }
+          renderVoiceOptions(providerSelect.value);
+          log("Stage 8 TTS", "ok", "Voice catalog loaded", "Sarvam / Rumik / Smallest.ai voices ready to pick", {
+            sarvam: ttsCatalog.sarvam?.voices?.length || 0,
+            rumik: ttsCatalog.rumik?.voices?.length || 0,
+            smallest: ttsCatalog.smallest?.voices?.length || 0,
+          });
+        } catch (error) {
+          voiceNote.textContent = "Could not load the voice catalog; defaulting to Sarvam.";
+          log("Stage 8 TTS", "warn", "Voice catalog load failed", error.message);
+        }
+      };
+
+      providerSelect.addEventListener("change", () => renderVoiceOptions(providerSelect.value));
+
+      // ---- Live pipeline monitor -------------------------------------------
+      const setTile = (id, state, val, sub) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.className = `mtile m-${state}`;
+        el.querySelector(".mval").textContent = val;
+        el.querySelector(".msub").textContent = sub || " ";
+      };
+      const latencyState = (ms, good, okay) => (ms <= good ? "ok" : ms <= okay ? "warn" : "error");
+      const shortProvider = (s) => {
+        s = String(s || "").toLowerCase();
+        if (s.includes("sarvam")) return "Sarvam";
+        if (s.includes("60db") || s.includes("sixtydb")) return "60db";
+        if (s.includes("kitten")) return "Kitten";
+        if (s.includes("assemblyai")) return "AssemblyAI";
+        if (s.includes("deepgram")) return "Deepgram";
+        if (s.includes("groq")) return "Groq";
+        if (s.includes("gpt") || s.includes("openai")) return "OpenAI";
+        if (s.includes("llama")) return "Groq llama";
+        return s ? s.slice(0, 14) : "?";
+      };
+
+      const updateMonitor = (event) => {
+        const { label = "", details = {}, message = "" } = event;
+        const m = details.metrics || {};
+        try {
+          if (label === "STT metrics" || label === "Transcript final") {
+            const prov = shortProvider(m.label || (m.metadata && m.metadata.model_provider));
+            if (label === "Transcript final") {
+              setTile("m-stt", "ok", "hearing you", `last: "${String(message).slice(0, 26)}"`);
+            } else if (prov !== "?") {
+              setTile("m-stt", "ok", prov, "streaming");
+            }
+          } else if (label === "End of utterance") {
+            const ms = Math.round(details.value ?? (m.end_of_utterance_delay || 0) * 1000);
+            setTile("m-turn", latencyState(ms, 1000, 1800), `${ms} ms`, `transcript ${Math.round(details.transcription_delay_ms ?? 0)} ms`);
+          } else if (label === "LLM metrics") {
+            const ttft = Math.round((m.ttft || 0) * 1000);
+            const name = shortProvider((m.metadata && m.metadata.model_name) || "");
+            setTile("m-llm", latencyState(ttft, 1000, 2000), `${name}`, `ttft ${ttft} ms`);
+          } else if (label === "LLM fallback used") {
+            setTile("m-llm", "error", "FALLBACK", String(details.provider || message).slice(0, 30));
+          } else if (label === "LLM recovered") {
+            setTile("m-llm", "warn", "recovered", String(details.provider || "").slice(0, 30));
+          } else if (label === "TTS metrics") {
+            const ttfb = Math.round((m.ttfb || 0) * 1000);
+            const prov = shortProvider(m.label || "");
+            setTile("m-tts", latencyState(ttfb, 500, 900), prov, `ttfb ${ttfb} ms`);
+          } else if (label === "Greeting queued" || label === "Speech created") {
+            setTile("m-tts", "warn", "queued", String(message || label).slice(0, 30));
+          } else if (label === "Greeting accepted") {
+            setTile("m-tts", "ok", "greeting sent", `${Math.round(details.duration_ms || 0)} ms`);
+          } else if (label === "Agent state") {
+            if (String(message).includes("speaking")) {
+              setTile("m-tts", "ok", "agent speaking", message);
+            }
+          } else if (label === "TTS fallback used") {
+            setTile("m-tts", "error", "FALLBACK", String(details.provider || "").slice(0, 30));
+          } else if (label === "Tool batch completed") {
+            const calls = (details.calls || []).map((c) => c.name).join(", ");
+            setTile("m-tools", "ok", calls.slice(0, 24) || "tool ran", "completed");
+          } else if (/done$/.test(label) && event.stage === "Stage 10 Tools DB") {
+            setTile("m-tools", "ok", label.replace(" done", ""), `${Math.round(details.duration_ms || 0)} ms`);
+          } else if (/failed/.test(label) && event.stage === "Stage 10 Tools DB") {
+            setTile("m-tools", "error", label.slice(0, 24), "check logs");
+          } else if (label === "Slot cache preloaded") {
+            setTile("m-tools", "ok", "slots preloaded", String(message).slice(0, 28));
+          }
+        } catch (e) { /* monitor must never break logging */ }
+      };
+      // ----------------------------------------------------------------------
 
       const clearVisibleLogs = () => {
         logBuffer.length = 0;
@@ -334,6 +491,13 @@
           const data = await response.json();
           backendCursor = data.next ?? backendCursor;
           for (const event of data.events || []) {
+            const eventKey = `${event.ts || ""}|${event.stage || ""}|${event.label || ""}|${event.message || ""}|${JSON.stringify(event.details || {})}`;
+            if (seenBackendEvents.has(eventKey)) continue;
+            seenBackendEvents.add(eventKey);
+            if (event.label === "VAD metrics") {
+              updateMonitor(event);
+              continue;
+            }
             logEvent(event);
           }
         } catch (error) {
@@ -343,26 +507,57 @@
 
       const attachAgentAudio = (track, publication, participant) => {
         if (track.kind !== Track.Kind.Audio) return;
+        const participantId = participant?.identity || "agent";
+        const trackSid = publication?.trackSid || track.sid || "";
+        const existingSelector = `audio[data-participant="${participantId}"][data-track-sid="${trackSid}"]`;
+        if (trackSid && document.querySelector(existingSelector)) return;
         const startedAt = performance.now();
         const audio = track.attach();
         audio.autoplay = true;
-        audio.dataset.participant = participant?.identity || "agent";
+        audio.muted = false;
+        audio.playsInline = true;
+        audio.dataset.participant = participantId;
+        audio.dataset.trackSid = trackSid;
         audio.addEventListener("playing", () => {
           log("Stage 9 Playback", "ok", "Agent audio playing", "Remote audio element started", {
-            participant: participant?.identity || "agent",
+            participant: participantId,
             elapsed_ms: Math.round(performance.now() - startedAt)
           });
         }, { once: true });
         document.body.appendChild(audio);
         log("Stage 9 Playback", "ok", "Agent audio subscribed", "Remote agent audio track attached", {
-          participant: participant?.identity || "agent",
-          track_sid: publication?.trackSid || null
+          participant: participantId,
+          track_sid: trackSid || null
+        });
+        audio.play().then(() => {
+          log("Stage 9 Playback", "ok", "Agent audio play requested", "Browser accepted remote audio playback", {
+            participant: participantId,
+            track_sid: trackSid || null,
+            elapsed_ms: Math.round(performance.now() - startedAt)
+          });
+        }).catch((error) => {
+          log("Stage 9 Playback", "error", "Agent audio blocked", error.message || "Browser blocked remote audio playback", {
+            participant: participantId,
+            track_sid: trackSid || null
+          });
+        });
+      };
+
+      const attachExistingAgentAudio = (markReady) => {
+        room?.remoteParticipants?.forEach((participant) => {
+          participant.trackPublications?.forEach((publication) => {
+            if (publication?.track && publication.kind === Track.Kind.Audio) {
+              markReady("Existing audio track ready", participant);
+              attachAgentAudio(publication.track, publication, participant);
+            }
+          });
         });
       };
 
       log("Stage 0 Worker", "info", "Preview loaded", "Localhost voice console is ready", {
         elapsed_ms: Math.round(performance.now() - pageStartedAt)
       });
+      loadTtsCatalog();
       initializeBackendCursor();
       setInterval(pollBackendLogs, 900);
 
@@ -370,6 +565,7 @@
         const clickStartedAt = performance.now();
         sessionLogActive = true;
         backendCursor = 0;
+        seenBackendEvents.clear();
         clearVisibleLogs();
         button.disabled = true;
         stopButton.hidden = true;
@@ -378,15 +574,18 @@
         log("Stage 1 Auth", "info", "Token request", "Requesting LiveKit access token");
         try {
           const tokenStartedAt = performance.now();
-          const selectedVoice = document.getElementById("voice").value;
-          document.getElementById("voice").disabled = true;
-          const response = await fetch(`/api/token?reset_logs=1&voice=${encodeURIComponent(selectedVoice)}`, { cache: "no-store" });
+          const selectedProvider = providerSelect.value;
+          const selectedVoice = voiceSelect.value;
+          providerSelect.disabled = true;
+          voiceSelect.disabled = true;
+          const response = await fetch(`/api/token?reset_logs=1&provider=${encodeURIComponent(selectedProvider)}&voice=${encodeURIComponent(selectedVoice)}`, { cache: "no-store" });
           const data = await response.json();
           if (!response.ok || data.error) throw new Error(data.error || "token request failed");
 
           log("Stage 1 Auth", "ok", "Token generated", `Token generated for ${data.participant}`, {
             elapsed_ms: Math.round(performance.now() - tokenStartedAt),
             livekit_url: data.url,
+            provider: data.provider,
             voice: data.voice
           });
           room = new Room({ adaptiveStream: true, dynacast: true });
@@ -403,7 +602,21 @@
               elapsed_ms: Math.round(performance.now() - clickStartedAt)
             }))
             .on(RoomEvent.Disconnected, () => log("Stage 2 WebRTC", "warn", "Room disconnected", "Browser disconnected from LiveKit room"))
-            .on(RoomEvent.ParticipantConnected, (participant) => markAgentReady("Participant joined", participant))
+            .on(RoomEvent.ParticipantConnected, (participant) => {
+              markAgentReady("Participant joined", participant);
+              setTimeout(() => attachExistingAgentAudio(markAgentReady), 100);
+            })
+            .on(RoomEvent.TrackPublished, (publication, participant) => {
+              if (publication.kind !== Track.Kind.Audio) return;
+              log("Stage 9 Playback", "info", "Agent audio published", "Remote audio publication announced", {
+                participant: participant?.identity || "agent",
+                track_sid: publication?.trackSid || null
+              });
+              if (publication.track) {
+                markAgentReady("Published audio track ready", participant);
+                attachAgentAudio(publication.track, publication, participant);
+              }
+            })
             .on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
               markAgentReady("Agent audio track ready", participant);
               attachAgentAudio(track, publication, participant);
@@ -419,22 +632,37 @@
           log("Stage 2 WebRTC", "ok", "Room connect complete", "WebRTC connection established", {
             elapsed_ms: Math.round(performance.now() - connectStartedAt)
           });
+          attachExistingAgentAudio(markAgentReady);
+          setTimeout(() => attachExistingAgentAudio(markAgentReady), 500);
+          setTimeout(() => attachExistingAgentAudio(markAgentReady), 1500);
 
           const dispatchStartedAt = performance.now();
-          log("Stage 4 Worker Dispatch", "info", "Waiting for agent", "Waiting for LiveKit worker to join this room");
+          log("Stage 4 Worker Dispatch", "info", "Agent readiness watch", "Watching for LiveKit worker/audio while continuing call setup");
           if (room.remoteParticipants?.size > 0) {
             const firstAgent = Array.from(room.remoteParticipants.values())[0];
             markAgentReady("Participant already joined", firstAgent);
+            attachExistingAgentAudio(markAgentReady);
           }
-          await Promise.race([
+          Promise.race([
             new Promise((resolve) => {
               agentReadyResolve = resolve;
               if (agentReady) resolve(true);
             }),
-            new Promise((_, reject) => setTimeout(() => reject(new Error("Agent did not join this room within 12 seconds. Worker may be reconnecting.")), 12000))
-          ]);
-          log("Stage 4 Worker Dispatch", "ok", "Agent ready", "Worker joined room; microphone can start", {
-            elapsed_ms: Math.round(performance.now() - dispatchStartedAt)
+            new Promise((resolve) => setTimeout(() => resolve(false), 3500))
+          ]).then((agentReadySignal) => {
+            if (agentReadySignal) {
+              log("Stage 4 Worker Dispatch", "ok", "Agent ready", "Worker/audio signal received", {
+                elapsed_ms: Math.round(performance.now() - dispatchStartedAt)
+              });
+            } else {
+              log(
+                "Stage 4 Worker Dispatch",
+                "warn",
+                "Agent signal pending",
+                "No participant/audio event yet; microphone is already live and backend logs will show worker state",
+                { elapsed_ms: Math.round(performance.now() - dispatchStartedAt) }
+              );
+            }
           });
 
           log("Stage 3 Microphone", "info", "Mic permission", "Requesting microphone permission");
@@ -468,7 +696,10 @@
           if (room) room.disconnect();
         } finally {
           button.disabled = false;
-          if (button.hidden === false) document.getElementById("voice").disabled = false;
+          if (button.hidden === false) {
+            providerSelect.disabled = false;
+            voiceSelect.disabled = false;
+          }
         }
       });
 
@@ -486,7 +717,8 @@
         status.textContent = "Call ended. Pick a voice and click start to talk again.";
         button.hidden = false;
         stopButton.hidden = true;
-        document.getElementById("voice").disabled = false;
+        providerSelect.disabled = false;
+        voiceSelect.disabled = false;
         log("Stage 2 WebRTC", "warn", "Call ended", "User ended the call");
       });
     </script>

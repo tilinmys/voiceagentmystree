@@ -7,6 +7,7 @@ livekit-plugins-cartesia==1.6.4
 livekit-plugins-silero==1.6.4
 livekit-plugins-noise-cancellation==0.2.6
 livekit-plugins-turn-detector==1.6.4
+livekit-plugins-elevenlabs==1.6.4
 python-dotenv>=1.0
 websockets>=15.0
 kittentts @ https://github.com/KittenML/KittenTTS/releases/download/0.8.1/kittentts-0.8.1-py3-none-any.whl

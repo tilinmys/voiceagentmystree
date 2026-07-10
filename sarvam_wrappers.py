@@ -25,6 +25,72 @@ _seen_unknown_types: set[str] = set()
 
 # At least one letter or digit (any script) — the minimum Sarvam will accept.
 _SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0900-\u097F]", re.UNICODE)
+_SARVAM_V3_SPEAKERS = {
+    "aditya", "ritu", "ashutosh", "priya", "neha", "rahul", "pooja", "rohan",
+    "simran", "kavya", "amit", "dev", "ishita", "shreya", "ratan", "varun",
+    "manan", "sumit", "roopa", "kabir", "aayan", "shubh", "advait", "anand",
+    "tanya", "tarun", "sunny", "mani", "gokul", "vijay", "shruti", "suhani",
+    "mohit", "kavitha", "rehan", "soham", "rupali", "niharika",
+}
+
+
+def _payload_shape(value):
+    if isinstance(value, dict):
+        return {str(k): _payload_shape(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return ["list", len(value)]
+    if isinstance(value, str):
+        return "str"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if value is None:
+        return "null"
+    return type(value).__name__
+
+
+def _normalize_tts_text(text: str, *, max_chars: int) -> str:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized or not _SPEAKABLE_RE.search(normalized):
+        return ""
+    return normalized[:max_chars].strip()
+
+
+def _sarvam_tts_config_payload(tts_instance: "SarvamTTS") -> dict:
+    speaker = str(tts_instance._speaker or "").strip().lower()
+    if "v3" in tts_instance._model and speaker not in _SARVAM_V3_SPEAKERS:
+        raise ValueError(f"Unsupported Sarvam bulbul:v3 speaker: {speaker!r}")
+    data = {
+        "target_language_code": tts_instance._target_language_code,
+        "speaker": speaker,
+        "pace": tts_instance._pace,
+        "max_chunk_length": tts_instance._max_chunk_length,
+        "output_audio_codec": tts_instance._output_audio_codec,
+    }
+    # Live probe on 2026-07-09: bulbul:v3 websocket rejects
+    # min_buffer_size with 422 "Input parameters has to be a valid dictionary".
+    # Keep the local buffering knob, but never send it unless explicitly enabled
+    # for a future Sarvam API revision.
+    if os.getenv("SARVAM_SEND_MIN_BUFFER_SIZE", "false").lower() in {"1", "true", "yes", "on"}:
+        data["min_buffer_size"] = tts_instance._min_buffer_size
+    return {"type": "config", "data": data}
+
+
+def _sarvam_tts_text_payload(text: str, *, max_chars: int) -> dict | None:
+    normalized = _normalize_tts_text(text, max_chars=max_chars)
+    if not normalized:
+        return None
+    payload = {"type": "text", "data": {"text": normalized}}
+    if not isinstance(payload.get("data"), dict):
+        raise ValueError("Sarvam text payload data must be a dictionary.")
+    return payload
+
+
+def _sarvam_tts_flush_payload() -> dict:
+    return {"type": "flush", "data": {}}
 
 
 def _redact_url(url: str) -> str:
@@ -74,8 +140,10 @@ def _pcm16_to_wav_bytes(pcm: bytes, *, sample_rate: int, num_channels: int) -> b
 
 
 def _strip_wav_header(audio_bytes: bytes) -> bytes:
-    if audio_bytes.startswith(b"RIFF") and len(audio_bytes) > 44:
-        return audio_bytes[44:]
+    if audio_bytes.startswith(b"RIFF"):
+        idx = audio_bytes.find(b"data")
+        if idx != -1 and len(audio_bytes) > idx + 8:
+            return audio_bytes[idx + 8:]
     return audio_bytes
 
 
@@ -98,13 +166,34 @@ class SarvamSTT(stt.STT):
         self._language_code = language_code
         self._base_url = base_url
 
+    _VALID_LANGS = {
+        "en-IN", "hi-IN", "bn-IN", "gu-IN", "kn-IN", "ml-IN",
+        "mr-IN", "od-IN", "pa-IN", "ta-IN", "te-IN", "unknown",
+    }
+
+    def _sanitize_language(self, language) -> str:
+        """The agent framework passes hints like 'en' or NOT_GIVEN sentinels.
+        Sarvam goes SILENT (no error, no transcripts) on codes it doesn't know,
+        which made the agent deaf in live sessions - so anything that isn't a
+        known Sarvam code falls back to the configured language."""
+        if isinstance(language, str):
+            norm = language.strip()
+            if norm in self._VALID_LANGS:
+                return norm
+            low = norm.lower()
+            if low in {"en", "en-us", "en-gb", "en-in"}:
+                return "en-IN"
+            if low in {"hi", "hi-in"}:
+                return "hi-IN"
+        return self._language_code
+
     def stream(
         self,
         *,
-        language: str | None = None,
+        language=None,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> "SarvamSpeechStream":
-        lang = language or self._language_code
+        lang = self._sanitize_language(language)
         return SarvamSpeechStream(self, self._api_key, self._model, lang, self._base_url, conn_options)
 
     async def _recognize_impl(
@@ -181,7 +270,12 @@ class SarvamSpeechStream(stt.SpeechStream):
                             is_final = resp.get("is_final", False)
                         elif "data" in resp and isinstance(resp["data"], dict) and "transcript" in resp["data"]:
                             transcript = resp["data"]["transcript"]
-                            is_final = resp["data"].get("is_final", False)
+                            # Verified against the live API (saarika:v2.5 ws): the server
+                            # runs its own VAD and emits one type=="data" message per
+                            # finished speech segment, with NO is_final flag. Treat those
+                            # as FINAL — otherwise the agent only ever sees interims and
+                            # the turn never completes.
+                            is_final = bool(resp["data"].get("is_final", resp.get("type") == "data"))
 
                         if transcript:
                             event_type = (
@@ -305,19 +399,12 @@ class SarvamTTS(tts.TTS):
         return float(os.getenv("SARVAM_TTS_IDLE_TIMEOUT", "3.0"))
 
     def config_message(self) -> str:
-        return json.dumps(
-            {
-                "type": "config",
-                "data": {
-                    "target_language_code": self._target_language_code,
-                    "speaker": self._speaker,
-                    "pace": self._pace,
-                    "min_buffer_size": self._min_buffer_size,
-                    "max_chunk_length": self._max_chunk_length,
-                    "output_audio_codec": "wav",
-                },
-            }
+        payload = _sarvam_tts_config_payload(self)
+        logger.debug(
+            "Sarvam TTS config payload shape=%s",
+            _payload_shape(payload),
         )
+        return json.dumps(payload)
 
     def synthesize(
         self,
@@ -368,6 +455,8 @@ async def _run_sarvam_tts_ws(
         await websocket.send(tts_instance.config_message())
 
         input_done = asyncio.Event()
+        fatal_tts_error = asyncio.Event()
+        last_payload_shape = {"type": "none"}
 
         async def send_loop() -> None:
             # Sarvam rejects text messages with no letters/digits with a fatal
@@ -391,27 +480,45 @@ async def _run_sarvam_tts_ws(
                 )
 
             async def send_buffer(force: bool = False) -> bool:
-                nonlocal buffer, pending_since_flush
+                nonlocal buffer, pending_since_flush, last_payload_shape
+                if fatal_tts_error.is_set():
+                    buffer = ""
+                    return False
                 if not should_send_buffer(force=force):
                     return False
-                text = buffer.strip()
-                if not text or not _SPEAKABLE_RE.search(text):
+                payload = _sarvam_tts_text_payload(
+                    buffer,
+                    max_chars=tts_instance._max_chunk_length,
+                )
+                if payload is None:
                     buffer = ""
                     return False
                 mark_started()
-                logger.debug("Sarvam TTS sending text chunk chars=%s text=%r", len(text), text[:160])
-                await websocket.send(json.dumps({"type": "text", "data": {"text": text}}))
+                text = payload["data"]["text"]
+                last_payload_shape = _payload_shape(payload)
+                logger.debug(
+                    "Sarvam TTS sending text payload shape=%s text_len=%s",
+                    last_payload_shape,
+                    len(text),
+                )
+                await websocket.send(json.dumps(payload))
                 buffer = ""
                 pending_since_flush = True
                 return True
 
             try:
                 async for item in input_aiter:
+                    if fatal_tts_error.is_set():
+                        buffer = ""
+                        break
                     if item is None:
                         await send_buffer(force=True)
                         buffer = ""
                         if pending_since_flush:
-                            await websocket.send(json.dumps({"type": "flush", "data": {}}))
+                            payload = _sarvam_tts_flush_payload()
+                            last_payload_shape = _payload_shape(payload)
+                            logger.debug("Sarvam TTS sending flush payload shape=%s", last_payload_shape)
+                            await websocket.send(json.dumps(payload))
                             pending_since_flush = False
                         continue
                     if not item:
@@ -420,7 +527,10 @@ async def _run_sarvam_tts_ws(
                     await send_buffer(force=False)
                 await send_buffer(force=True)
                 if pending_since_flush:
-                    await websocket.send(json.dumps({"type": "flush", "data": {}}))
+                    payload = _sarvam_tts_flush_payload()
+                    last_payload_shape = _payload_shape(payload)
+                    logger.debug("Sarvam TTS sending flush payload shape=%s", last_payload_shape)
+                    await websocket.send(json.dumps(payload))
             finally:
                 input_done.set()
 
@@ -448,11 +558,34 @@ async def _run_sarvam_tts_ws(
                 logger.debug("Sarvam TTS received type=%s", rtype)
 
                 if rtype == "error" or "error" in resp:
+                    data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+                    code = int(data.get("code", -1) or -1)
+                    message = str(data.get("message") or resp.get("error") or "Sarvam TTS error")
+                    logger.warning(
+                        "Sarvam TTS rejected stream code=%s message=%s last_payload_shape=%s",
+                        code,
+                        message,
+                        last_payload_shape,
+                    )
+                    # Treat schema/validation failures as recoverable at the
+                    # AgentSession level: skip this failed chunk and keep the call
+                    # alive instead of raising a non-recoverable tts_error.
+                    if code == 422:
+                        fatal_tts_error.set()
+                        return
                     raise APIStatusError(
                         "Sarvam TTS rejected the stream.",
-                        status_code=-1,
-                        body=resp,
-                        retryable=False,
+                        status_code=code,
+                        body={
+                            "type": resp.get("type"),
+                            "data": {
+                                "code": code,
+                                "message": message,
+                                "request_id": data.get("request_id"),
+                            },
+                            "last_payload_shape": last_payload_shape,
+                        },
+                        retryable=True,
                     )
 
                 if rtype == "audio":
@@ -474,7 +607,21 @@ async def _run_sarvam_tts_ws(
         send_task = asyncio.create_task(send_loop())
         recv_task = asyncio.create_task(recv_loop())
         try:
-            await asyncio.gather(send_task, recv_task)
+            done, pending = await asyncio.wait(
+                {send_task, recv_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                task.result()
+            if fatal_tts_error.is_set():
+                return
+            if input_done.is_set() and not recv_task.done():
+                await recv_task
+            elif recv_task.done() and not send_task.done():
+                send_task.cancel()
+                await asyncio.gather(send_task, return_exceptions=True)
+            else:
+                await asyncio.gather(send_task, recv_task)
         finally:
             for task in (send_task, recv_task):
                 if not task.done():

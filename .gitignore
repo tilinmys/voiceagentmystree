@@ -24,6 +24,10 @@ data/
 *.sqlite3
 *.db
 
+# Auto-generated per-voice greeting cache - regenerated on first use,
+# hash-keyed to GREETING_TEXT so it never goes stale. Not source.
+assets/audio/greetings/
+
 # Logs
 *.log
 logs/

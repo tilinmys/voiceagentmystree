@@ -1,159 +1,290 @@
-"""Head-to-head TTS benchmark: Sarvam Bulbul V3 vs 60db.ai.
+"""Benchmark curated Indian TTS voices across Sarvam / Rumik / Smallest.ai
+to find the fastest + most reliable option for the MyStree Clinic agent.
 
-Drives both providers through the real LiveKit streaming path (token-by-token
-push_text, flush, end_input — exactly what the agent does with LLM output) and
-measures what matters on a phone call:
+Supersedes the old Sarvam-vs-60db benchmark - 60db was removed from the
+runtime TTS chain (see CHANGELOG). Hits each provider's HTTP API directly (no
+LiveKit room needed). Measures:
 
-  connect  - wall time to create the stream and deliver the first token
-  ttfb     - time from stream start to FIRST audio frame (caller hears voice)
-  total    - wall time until the full reply is synthesized
-  audio    - seconds of audio produced (completeness check vs text length)
-  fails    - any run that errored or produced no audio
+  - ttfb_ms: time from request sent to first audio byte received (true
+    time-to-first-byte for Rumik and Smallest.ai, which both stream over
+    HTTP). Sarvam's REST endpoint returns one buffered JSON blob (no
+    streaming), so its number is full round-trip latency, not TTFB - the
+    production path (sarvam_wrappers.py) uses a websocket and is materially
+    faster than this REST call. Treat the Sarvam column as a ceiling, not the
+    real number.
+  - total_ms: time to the last byte of audio.
 
-Saves one WAV per provider per phrase to assets/audio/compare/ for human
-listening (quality/naturalness can only be judged by ear).
-
-Run:  python scripts/tts_benchmark.py [runs_per_phrase]
+Usage:
+    python scripts/tts_benchmark.py [--runs 3] [--out logs/tts_benchmark_report.md]
 """
-import asyncio
-import os
+
+from __future__ import annotations
+
+import argparse
+import json
 import statistics
 import sys
 import time
-import wave
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import requests
 
-from dotenv import load_dotenv
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
-load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+import voice_catalog  # noqa: E402
 
-from sarvam_wrappers import SarvamTTS  # noqa: E402
-from sixtydb_wrappers import SixtyDbTTS  # noqa: E402
-
-RUNS = int(sys.argv[1]) if len(sys.argv) > 1 else 3
-OUT_DIR = Path(__file__).resolve().parent.parent / "assets" / "audio" / "compare"
-
-PHRASES = {
-    "greeting": (
-        "Namaste! Welcome to MyStree Clinic, Indiranagar. "
-        "Tell me, are you calling for a new booking, or a follow-up?"
-    ),
-    "slots": (
-        "Haan ji madam, tomorrow Dr. Anita is free at ten thirty in the morning, "
-        "or five o'clock in the evening. Which one suits you?"
-    ),
-    "confirm": (
-        "Just to confirm, your appointment is with Dr. Anita on Wednesday, eighth July, "
-        "at five thirty in the evening. Your appointment ID is 1-4-2. Thank you for calling, madam. Namaste!"
-    ),
-}
+TEST_PHRASE = (
+    "Good morning, thank you for calling MyStree Clinic in Indiranagar. "
+    "I can help you book an appointment with our gynaecologist. "
+    "Could you please tell me your name and preferred date?"
+)
 
 
-def _tokenize(text: str, size: int = 12):
-    """Simulate LLM streaming: deliver the reply in small chunks."""
-    for i in range(0, len(text), size):
-        yield text[i : i + size]
-
-
-async def run_once(provider, text: str, save_path: Path | None):
-    start = time.perf_counter()
-    stream = provider.stream()
-    frames = []
-    ttfb = None
-    try:
-        for token in _tokenize(text):
-            stream.push_text(token)
-            await asyncio.sleep(0.02)  # ~LLM token pacing
-        stream.end_input()
-
-        async for ev in stream:
-            if ttfb is None:
-                ttfb = time.perf_counter() - start
-            frames.append(ev.frame)
-        total = time.perf_counter() - start
-    finally:
-        await stream.aclose()
-
-    audio_secs = sum(f.duration for f in frames)
-    if save_path and frames:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        with wave.open(str(save_path), "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(frames[0].sample_rate)
-            for f in frames:
-                w.writeframes(bytes(f.data))
-    return {"ttfb": ttfb, "total": total, "audio": audio_secs, "frames": len(frames)}
-
-
-async def bench(name: str, provider) -> dict:
-    results = []
-    failures = 0
-    for phrase_name, text in PHRASES.items():
-        for run in range(RUNS):
-            save = OUT_DIR / f"{name}_{phrase_name}.wav" if run == 0 else None
-            try:
-                r = await run_once(provider, text, save)
-                if not r["frames"] or r["ttfb"] is None:
-                    failures += 1
-                    print(f"  [{name}] {phrase_name} run{run + 1}: NO AUDIO")
-                    continue
-                # completeness: expect roughly >= 1s of audio per 20 chars
-                expected_min = len(text) / 25
-                truncated = " TRUNCATED?" if r["audio"] < expected_min else ""
-                results.append(r)
-                print(
-                    f"  [{name}] {phrase_name} run{run + 1}: ttfb={r['ttfb'] * 1000:.0f}ms "
-                    f"total={r['total']:.2f}s audio={r['audio']:.2f}s{truncated}"
-                )
-            except Exception as exc:
-                failures += 1
-                print(f"  [{name}] {phrase_name} run{run + 1}: FAILED - {type(exc).__name__}: {str(exc)[:120]}")
-    if not results:
-        return {"name": name, "failures": failures, "runs": 0}
-    return {
-        "name": name,
-        "runs": len(results),
-        "failures": failures,
-        "ttfb_median": statistics.median(r["ttfb"] for r in results) * 1000,
-        "ttfb_p95": sorted(r["ttfb"] for r in results)[max(0, int(len(results) * 0.95) - 1)] * 1000,
-        "total_median": statistics.median(r["total"] for r in results),
-        "audio_total": sum(r["audio"] for r in results),
-    }
-
-
-async def main() -> None:
-    sarvam = SarvamTTS(
-        api_key=os.environ["SARVAM_API_KEY"],
-        speaker=os.getenv("SARVAM_SPEAKER", "ishita"),
-        pace=float(os.getenv("SARVAM_PACE", "1.0")),
-    )
-    sixtydb = SixtyDbTTS(
-        api_key=os.environ["SIXTY_DB_API_KEY"],
-        voice_id=os.getenv("SIXTY_DB_VOICE_ID", "fbb75ed2-975a-40c7-9e06-38e30524a9a1"),
-        ws_url=os.getenv("SIXTY_DB_TTS_URL", "wss://api.60db.ai/ws/tts"),
-        speed=float(os.getenv("SIXTY_DB_TTS_SPEED", "1.0")),
-    )
-
-    print(f"Benchmark: {RUNS} runs x {len(PHRASES)} phrases per provider\n")
-    print("--- Sarvam Bulbul V3 ---")
-    s = await bench("sarvam", sarvam)
-    print("\n--- 60db.ai ---")
-    d = await bench("60db", sixtydb)
-
-    print("\n================ SUMMARY ================")
-    for r in (s, d):
-        if r["runs"] == 0:
-            print(f"{r['name']:>8}: ALL RUNS FAILED ({r['failures']} failures)")
+def load_env() -> dict:
+    env = {}
+    for candidate in [ROOT / ".env", ROOT.parent / ".env"]:
+        if not candidate.exists():
             continue
-        print(
-            f"{r['name']:>8}: ttfb median {r['ttfb_median']:.0f}ms | ttfb p95 {r['ttfb_p95']:.0f}ms | "
-            f"total median {r['total_median']:.2f}s | failures {r['failures']}/{r['runs'] + r['failures']}"
+        for raw in candidate.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            env.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    return env
+
+
+ENV = load_env()
+
+
+def bench_sarvam(voice_id: str) -> dict:
+    key = ENV.get("SARVAM_API_KEY")
+    if not key:
+        return {"error": "SARVAM_API_KEY not configured"}
+    started = time.perf_counter()
+    try:
+        resp = requests.post(
+            "https://api.sarvam.ai/text-to-speech",
+            headers={"api-subscription-key": key, "Content-Type": "application/json"},
+            json={
+                "text": TEST_PHRASE,
+                "target_language_code": "en-IN",
+                "speaker": voice_id,
+                "model": "bulbul:v3",
+            },
+            timeout=30,
         )
-    print(f"\nWAV samples for listening: {OUT_DIR}")
+        total_ms = (time.perf_counter() - started) * 1000
+        if resp.status_code != 200:
+            return {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+        payload = resp.json()
+        audio_b64 = (payload.get("audios") or [""])[0]
+        return {"ttfb_ms": None, "total_ms": round(total_ms, 1), "audio_bytes": len(audio_b64)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def bench_rumik(voice_id: str) -> dict:
+    key = ENV.get("RUMIK_API_KEY")
+    if not key:
+        return {"error": "RUMIK_API_KEY not configured"}
+    voice_meta = voice_catalog.RUMIK_VOICES.get(voice_id, {})
+    description = voice_meta.get("description")
+    if not description:
+        return {"error": f"no description configured for rumik voice '{voice_id}'"}
+    started = time.perf_counter()
+    ttfb_ms = None
+    total_bytes = 0
+    try:
+        with requests.post(
+            "https://silk-api.rumik.ai/v1/tts",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={
+                "model": voice_catalog.RUMIK_DEFAULT_MODEL,
+                "text": TEST_PHRASE,
+                "description": description,
+                "temperature": 0.4,
+            },
+            stream=True,
+            timeout=30,
+        ) as resp:
+            if resp.status_code != 200:
+                return {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+            for chunk in resp.iter_content(chunk_size=2048):
+                if not chunk:
+                    continue
+                if ttfb_ms is None:
+                    ttfb_ms = (time.perf_counter() - started) * 1000
+                total_bytes += len(chunk)
+        total_ms = (time.perf_counter() - started) * 1000
+        return {"ttfb_ms": round(ttfb_ms, 1) if ttfb_ms else None, "total_ms": round(total_ms, 1), "audio_bytes": total_bytes}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def bench_smallest(voice_id: str) -> dict:
+    key = ENV.get("SMALLEST_API_KEY")
+    if not key:
+        return {"error": "SMALLEST_API_KEY not configured"}
+    started = time.perf_counter()
+    ttfb_ms = None
+    total_bytes = 0
+    try:
+        with requests.post(
+            f"https://waves-api.smallest.ai/api/v1/{voice_catalog.SMALLEST_DEFAULT_MODEL}/get_speech",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={
+                "text": TEST_PHRASE,
+                "voice_id": voice_id,
+                "sample_rate": voice_catalog.SMALLEST_SAMPLE_RATE,
+            },
+            stream=True,
+            timeout=30,
+        ) as resp:
+            if resp.status_code != 200:
+                return {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+            for chunk in resp.iter_content(chunk_size=2048):
+                if not chunk:
+                    continue
+                if ttfb_ms is None:
+                    ttfb_ms = (time.perf_counter() - started) * 1000
+                total_bytes += len(chunk)
+        total_ms = (time.perf_counter() - started) * 1000
+        return {"ttfb_ms": round(ttfb_ms, 1) if ttfb_ms else None, "total_ms": round(total_ms, 1), "audio_bytes": total_bytes}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+BENCHERS = {"sarvam": bench_sarvam, "rumik": bench_rumik, "smallest": bench_smallest}
+
+
+def run_benchmark(runs: int) -> list[dict]:
+    results = []
+    for provider, voices in voice_catalog.CATALOG.items():
+        bencher = BENCHERS[provider]
+        for voice_id, meta in voices.items():
+            samples = []
+            errors = []
+            for _ in range(runs):
+                result = bencher(voice_id)
+                if "error" in result:
+                    errors.append(result["error"])
+                else:
+                    samples.append(result)
+                time.sleep(0.2)  # be polite to rate limits between calls
+            print(f"[{provider}] {meta['name']} ({voice_id}): "
+                  f"{len(samples)}/{runs} ok" + (f", errors={errors[:1]}" if errors else ""))
+            if samples:
+                total_median = statistics.median(s["total_ms"] for s in samples)
+                ttfb_values = [s["ttfb_ms"] for s in samples if s.get("ttfb_ms") is not None]
+                ttfb_median = statistics.median(ttfb_values) if ttfb_values else None
+                results.append({
+                    "provider": provider,
+                    "voice_id": voice_id,
+                    "name": meta["name"],
+                    "gender": meta.get("gender"),
+                    "style": meta.get("style"),
+                    "ttfb_ms": round(ttfb_median, 1) if ttfb_median else None,
+                    "total_ms": round(total_median, 1),
+                    "samples": len(samples),
+                    "errors": len(errors),
+                })
+            else:
+                results.append({
+                    "provider": provider, "voice_id": voice_id, "name": meta["name"],
+                    "gender": meta.get("gender"), "style": meta.get("style"),
+                    "ttfb_ms": None, "total_ms": None, "samples": 0, "errors": len(errors),
+                    "error_detail": errors[0] if errors else "unknown",
+                })
+    return results
+
+
+def rank_key(row: dict):
+    # Rank by TTFB when available (closer to real perceived latency), else total_ms.
+    metric = row["ttfb_ms"] if row["ttfb_ms"] is not None else row["total_ms"]
+    return (metric is None, metric if metric is not None else float("inf"))
+
+
+def render_report(results: list[dict]) -> str:
+    ok_rows = sorted((r for r in results if r["total_ms"] is not None), key=rank_key)
+    failed_rows = [r for r in results if r["total_ms"] is None]
+
+    lines = [
+        "# MyStree Clinic - TTS voice benchmark",
+        "",
+        f'Test phrase: "{TEST_PHRASE}"',
+        "",
+        "Sarvam's number is full non-streaming REST round-trip latency (no TTFB - "
+        "the production path uses a websocket and is faster). Rumik and "
+        "Smallest.ai numbers are true time-to-first-audio-byte over HTTP streaming.",
+        "",
+        "| Rank | Provider | Voice | Gender | Style | TTFB (ms) | Total (ms) | Samples |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for i, row in enumerate(ok_rows, start=1):
+        lines.append(
+            f"| {i} | {row['provider']} | {row['name']} (`{row['voice_id']}`) | "
+            f"{row['gender'] or '-'} | {row['style'] or '-'} | "
+            f"{row['ttfb_ms'] if row['ttfb_ms'] is not None else '-'} | "
+            f"{row['total_ms']} | {row['samples']} |"
+        )
+
+    if failed_rows:
+        lines.append("")
+        lines.append("## Failed / unavailable")
+        lines.append("| Provider | Voice | Error |")
+        lines.append("|---|---|---|")
+        for row in failed_rows:
+            lines.append(f"| {row['provider']} | {row['name']} (`{row['voice_id']}`) | {row.get('error_detail', 'unknown')} |")
+
+    if ok_rows:
+        best_per_provider = {}
+        for row in ok_rows:
+            best_per_provider.setdefault(row["provider"], row)
+        lines.append("")
+        lines.append("## Best voice per provider")
+        for provider, row in best_per_provider.items():
+            metric_label = "TTFB" if row["ttfb_ms"] is not None else "total"
+            metric_val = row["ttfb_ms"] if row["ttfb_ms"] is not None else row["total_ms"]
+            lines.append(f"- **{provider}**: {row['name']} (`{row['voice_id']}`) - {metric_val} ms {metric_label}")
+
+        overall = ok_rows[0]
+        lines.append("")
+        lines.append(
+            f"## Recommendation: fastest overall is **{overall['provider']} / {overall['name']}** "
+            f"(`{overall['voice_id']}`)."
+        )
+        lines.append(
+            "This is a latency-only signal - listen to the actual samples (voice quality, "
+            "Indian-accent naturalness, prosody on clinic vocabulary) before committing. "
+            "Latency differences under ~150ms will not be perceptible to a caller."
+        )
+
+    return "\n".join(lines)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--runs", type=int, default=2, help="Samples per voice (default 2)")
+    parser.add_argument("--out", type=str, default="logs/tts_benchmark_report.md")
+    parser.add_argument("--json-out", type=str, default="logs/tts_benchmark_results.json")
+    args = parser.parse_args()
+
+    results = run_benchmark(args.runs)
+    report = render_report(results)
+
+    out_path = ROOT / args.out
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(report, encoding="utf-8")
+
+    json_path = ROOT / args.json_out
+    json_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+
+    print("\n" + report)
+    print(f"\nReport written to {out_path}")
+    print(f"Raw results written to {json_path}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

@@ -154,6 +154,21 @@ def init_db(reset=False):
     )
     """)
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS call_reports (
+        report_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        room_name TEXT,
+        caller_phone TEXT,
+        patient_id INTEGER,
+        call_summary TEXT NOT NULL,
+        user_sentiment TEXT NOT NULL,
+        follow_up_required INTEGER NOT NULL DEFAULT 0,
+        report_json TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (patient_id) REFERENCES patients (patient_id)
+    )
+    """)
+
     cursor.execute("SELECT COUNT(*) FROM patients")
     if cursor.fetchone()[0] == 0:
         logger.info("Seeding mock patients...")
@@ -328,6 +343,49 @@ def get_appointments_by_patient_id(patient_id: int):
     return [dict(r) for r in rows]
 
 
+def get_patient_context_by_phone(phone: str):
+    """Fetch caller context for zero-latency greeting/prompt preload."""
+    patient = get_patient_by_phone(phone)
+    if not patient:
+        return None
+    return {
+        "patient": patient,
+        "appointments": get_appointments_by_patient_id(patient["patient_id"]),
+        "history": get_visit_history_by_patient_id(patient["patient_id"], limit=3),
+    }
+
+
+def save_call_report(report: dict) -> int:
+    """Persist post-call analysis without blocking the live conversation."""
+    import json
+
+    conn = _connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO call_reports (
+                room_name, caller_phone, patient_id, call_summary,
+                user_sentiment, follow_up_required, report_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                report.get("room_name"),
+                normalize_phone(report.get("caller_phone", "")) if report.get("caller_phone") else None,
+                report.get("patient_id"),
+                report.get("call_summary") or "No summary available.",
+                report.get("user_sentiment") or "unknown",
+                1 if report.get("follow_up_required") else 0,
+                json.dumps(report, ensure_ascii=True),
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
 def get_open_slots():
     """All future available slots — feeds the in-memory cache the agent reads from."""
     conn = _connect()
@@ -391,6 +449,69 @@ def book_slot(patient_id: int, doctor_name: str, slot_date: str, slot_time: str,
         appointment_id = cursor.lastrowid
         conn.commit()
         return appointment_id, None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def reschedule_appointment(appointment_id: int, new_date: str, new_time: str, new_doctor: str | None = None):
+    """Atomic reschedule: claim the new slot and free the old one in ONE transaction.
+
+    Returns (True, None) on success or (False, reason) where reason is
+    'not_found' | 'taken' | 'doctor_unavailable' | 'no_such_slot'.
+
+    Both slot flips happen inside a single BEGIN IMMEDIATE, so there is no
+    window where the caller holds zero slots or two slots, and a website
+    booking racing for the new slot simply wins or loses the guarded UPDATE.
+    """
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT doctor_name, appointment_date, appointment_time FROM appointments "
+            "WHERE appointment_id = ? AND status = 'Scheduled'",
+            (appointment_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return False, "not_found"
+        old_doctor, old_date, old_time = row
+        doctor = new_doctor or old_doctor
+
+        # 1) claim the NEW slot (guarded — loses cleanly to concurrent bookings)
+        cursor.execute(
+            "UPDATE slots SET status = 'booked', booked_via = 'voice_agent' "
+            "WHERE doctor_name LIKE ? AND slot_date = ? AND slot_time = ? AND status = 'available'",
+            (f"%{doctor}%", new_date, new_time),
+        )
+        if cursor.rowcount == 0:
+            cursor.execute(
+                "SELECT status FROM slots WHERE doctor_name LIKE ? AND slot_date = ? AND slot_time = ?",
+                (f"%{doctor}%", new_date, new_time),
+            )
+            status_row = cursor.fetchone()
+            conn.rollback()
+            if status_row is None:
+                return False, "no_such_slot"
+            return False, "doctor_unavailable" if status_row[0] == "closed" else "taken"
+
+        # 2) free the OLD slot and move the appointment
+        cursor.execute(
+            "UPDATE slots SET status = 'available', booked_via = NULL "
+            "WHERE doctor_name = ? AND slot_date = ? AND slot_time = ?",
+            (old_doctor, old_date, old_time),
+        )
+        cursor.execute(
+            "UPDATE appointments SET doctor_name = ?, appointment_date = ?, appointment_time = ? "
+            "WHERE appointment_id = ?",
+            (doctor, new_date, new_time, appointment_id),
+        )
+        conn.commit()
+        return True, None
     except Exception:
         conn.rollback()
         raise

@@ -1,5 +1,11 @@
 # Mystree Voice Agent Latency Notes
 
+## 2026-07-08 — Call Setup & Worker Readiness Diagnostics (BOM & Logging Fixes)
+
+- **UTF-8 BOM Error Resolved:** Removed UTF-8 BOM byte sequence (`EF-BB-BF`) at the beginning of `.env`, enabling python-dotenv to successfully load `LIVEKIT_URL`.
+- **Log Tail & Age Limits increased:** Set default `WORKER_HEALTH_TAIL_LINES=100000` and `WORKER_READY_MAX_AGE_SECONDS=86400` in `local_server.py` to prevent health events from being sliced out or expiring for healthy workers.
+- **Redirection fixed to ASCII:** Changed server execution to native `cmd /c` shell to write log files in standard ASCII/UTF-8 rather than PowerShell's UTF-16 (which inserted null bytes and broke regex parsing).
+
 ## 2026-07-07 — Token diet + LLM reorder (from ritu-voice call log analysis)
 
 - Per-turn latency composition measured live: EOU 1.5–2.0s (spikes 2.9–4.0s on first turn / cold turn-detector) + LLM ttft 0.9–4.3s + Sarvam ttfb ~0.3s. LLM prefill was the dominant recurring cost: ~3.0–3.5k prompt tokens paid TWICE per turn (preemptive generation + tool chains).

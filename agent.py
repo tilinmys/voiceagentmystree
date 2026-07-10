@@ -138,12 +138,19 @@ import db_helper
 
 db_helper.init_db(reset=os.getenv("SQLITE_RESET_ON_START", "false").lower() == "true")
 
+import dataclasses
+import aiohttp
+from urllib.parse import urlencode
+from livekit.agents.utils import is_given
+from livekit.agents import APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS
+from livekit.agents.types import NOT_GIVEN, NotGivenOr
 from livekit.agents import (
     Agent,
     AgentSession,
     EndpointingOptions,
     JobContext,
     JobProcess,
+    JobRequest,
     MetricsCollectedEvent,
     PreemptiveGenerationOptions,
     RoomInputOptions,
@@ -174,7 +181,20 @@ except Exception:  # pragma: no cover - optional dependency
     MultilingualModel = None
     multilingual_model = None
 
-from sarvam_wrappers import SarvamTTS
+from sarvam_wrappers import SarvamSTT, SarvamTTS
+from smallest_wrappers import SmallestTTS
+from rumik_wrappers import RumikTTS
+from voice_catalog import (
+    CATALOG as VOICE_CATALOG,
+    PROVIDERS as TTS_PROVIDERS,
+    RUMIK_DEFAULT_MODEL,
+    RUMIK_VOICES,
+    SMALLEST_DEFAULT_MODEL,
+    SMALLEST_SAMPLE_RATE,
+    SMALLEST_VOICES,
+    default_voice as voice_catalog_default,
+    is_valid as voice_catalog_is_valid,
+)
 
 try:
     from sixtydb_wrappers import SixtyDbTTS
@@ -230,7 +250,8 @@ def env_flag(name: str, default: bool = False) -> bool:
 
 
 GREETING_TEXT = (
-    "Namaste, MyStree Clinic. How can I help you today?"
+    "Namaste, thank you for calling MyStree Clinic... This is Gracy. "
+    "May I please have your name?"
 )
 GREETING_CACHE_DIR = Path(os.getenv("GREETING_CACHE_DIR", "assets/audio/greetings"))
 
@@ -297,9 +318,9 @@ async def ensure_greeting_cache(voice: str, sarvam_tts) -> None:
     except Exception:
         logger.warning("Greeting cache synthesis failed for %s", voice, exc_info=True)
 FILLER_TEXTS = [
-    "Haan ji, checking now.",
-    "Ji, just a second.",
-    "Theek hai, I am checking.",
+    "Let me check that for you... just a moment.",
+    "Sure, one second... pulling that up now.",
+    "Okay... just checking our calendar for you.",
 ]
 _last_filler_index = -1
 
@@ -537,18 +558,23 @@ class SlotCache:
             preferred = now
         preferred = max(preferred, now)
 
+        # heapq.nsmallest = one O(n) scan with a k-sized heap (O(n log k)),
+        # instead of sorting the whole cached slot list.
+        import heapq
+
         d = (doctor_name or "").lower()
-        candidates = [s for s in self._slots if not d or d in s["doctor_name"].lower()]
-        candidates.sort(
-            key=lambda s: (abs((self._slot_dt(s) - preferred).total_seconds()), self._slot_dt(s))
+        candidates = (s for s in self._slots if not d or d in s["doctor_name"].lower())
+        return heapq.nsmallest(
+            k, candidates,
+            key=lambda s: (abs((self._slot_dt(s) - preferred).total_seconds()), self._slot_dt(s)),
         )
-        return candidates[:k]
 
     def earliest(self, doctor_name: str | None = None, k: int = 3) -> list[dict]:
+        import heapq
+
         d = (doctor_name or "").lower()
-        candidates = [s for s in self._slots if not d or d in s["doctor_name"].lower()]
-        candidates.sort(key=self._slot_dt)
-        return candidates[:k]
+        candidates = (s for s in self._slots if not d or d in s["doctor_name"].lower())
+        return heapq.nsmallest(k, candidates, key=self._slot_dt)
 
 
 slot_cache = SlotCache()
@@ -645,6 +671,11 @@ _PHONE_WORDS = {
     "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
     "six": "6", "seven": "7", "eight": "8", "nine": "9",
 }
+
+
+def spoken_digits(value: str | int | None) -> str:
+    digits = re.sub(r"\D", "", str(value or ""))
+    return "-".join(digits) if digits else ""
 
 
 def extract_phone_candidate(text: str) -> str | None:
@@ -820,12 +851,251 @@ class BookingPrefetch:
 booking_prefetch = BookingPrefetch()
 
 
+def extract_caller_phone_from_metadata(participant) -> str | None:
+    metadata_values: list[str] = []
+    metadata = getattr(participant, "metadata", None) if participant is not None else None
+    if metadata:
+        metadata_values.append(str(metadata))
+        try:
+            payload = json.loads(metadata)
+            if isinstance(payload, dict):
+                for key in (
+                    "caller_phone",
+                    "caller_id",
+                    "phone",
+                    "sip_from",
+                    "sip.phoneNumber",
+                    "sip_trunk_phone_number",
+                ):
+                    value = payload.get(key)
+                    if value:
+                        metadata_values.append(str(value))
+        except Exception:
+            pass
+
+    attributes = getattr(participant, "attributes", None) if participant is not None else None
+    if isinstance(attributes, dict):
+        for key, value in attributes.items():
+            lowered = str(key).lower()
+            if any(token in lowered for token in ("phone", "caller", "sip")) and value:
+                metadata_values.append(str(value))
+
+    identity = getattr(participant, "identity", None) if participant is not None else None
+    if identity:
+        metadata_values.append(str(identity))
+
+    for raw in metadata_values:
+        phone = extract_phone_candidate(raw)
+        if phone:
+            return db_helper.normalize_phone(phone)
+    return None
+
+
+def parse_metadata_json(raw: object) -> dict:
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        payload = json.loads(str(raw))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def voice_from_metadata(payload: dict) -> str | None:
+    voice = str(payload.get("sarvam_speaker") or payload.get("voice") or "").strip().lower()
+    return voice if voice in SARVAM_V3_SPEAKERS else None
+
+
+def provider_and_voice_from_metadata(payload: dict) -> tuple[str, str | None]:
+    """Resolve (tts_provider, voice_id) from dispatch/participant metadata.
+
+    Falls back to Smallest.ai/Maithili - the agent's default voice engine -
+    on anything unrecognized so a bad or stale metadata payload can never
+    crash provider construction; it just silently lands on the known-good
+    default.
+    """
+    provider = str(payload.get("tts_provider") or "smallest").strip().lower()
+    if provider not in TTS_PROVIDERS:
+        provider = "smallest"
+
+    raw_voice = str(payload.get("voice_id") or payload.get("sarvam_speaker") or payload.get("voice") or "").strip()
+    if provider == "sarvam":
+        # Validate against the full bulbul:v3 speaker set, not just the
+        # shorter curated shortlist in voice_catalog.py (that list is a UI
+        # convenience; every SARVAM_V3_SPEAKERS entry is a real usable voice).
+        voice = raw_voice.lower()
+        if voice not in SARVAM_V3_SPEAKERS:
+            voice = None
+    else:
+        voice = raw_voice if voice_catalog_is_valid(provider, raw_voice) else None
+    return provider, voice
+
+
+def caller_phone_from_metadata_payload(payload: dict) -> str | None:
+    for key in ("caller_phone", "caller_id", "phone", "sip_from", "sip.phoneNumber"):
+        value = payload.get(key)
+        if value:
+            phone = extract_phone_candidate(str(value))
+            if phone:
+                return db_helper.normalize_phone(phone)
+    return None
+
+
+async def preload_user(caller_phone: str | None) -> dict:
+    started = time.perf_counter()
+    if not caller_phone:
+        pipeline_event(
+            "tools",
+            "info",
+            "Patient context preload skipped",
+            "No SIP caller ID or phone metadata available",
+            event="preload_user_skipped",
+        )
+        return {"caller_phone": None, "patient": None, "appointments": [], "history": []}
+
+    normalized = db_helper.normalize_phone(caller_phone)
+    try:
+        context = await asyncio.to_thread(db_helper.get_patient_context_by_phone, normalized)
+        if not context:
+            context = {"patient": None, "appointments": [], "history": []}
+        context["caller_phone"] = normalized
+        pipeline_event(
+            "tools",
+            "ok",
+            "Patient context preloaded",
+            "Caller record fetched before first LLM turn",
+            event="preload_user",
+            phone_tail=normalized[-4:],
+            patient_found=bool(context.get("patient")),
+            appointments=len(context.get("appointments") or []),
+            history=len(context.get("history") or []),
+            duration_ms=round((time.perf_counter() - started) * 1000, 2),
+        )
+        return context
+    except Exception as exc:
+        pipeline_event(
+            "tools",
+            "warn",
+            "Patient context preload failed",
+            str(exc),
+            event="preload_user_failed",
+            phone_tail=normalized[-4:],
+            traceback=traceback.format_exc(),
+        )
+        return {"caller_phone": normalized, "patient": None, "appointments": [], "history": []}
+
+
+def patient_context_prompt(preloaded: dict | None) -> str:
+    if not preloaded:
+        return "No caller-ID context was preloaded. Treat the caller normally and ask for name."
+    phone = preloaded.get("caller_phone")
+    patient = preloaded.get("patient")
+    history = preloaded.get("history") or []
+    appointments = preloaded.get("appointments") or []
+    phone_line = f"Caller ID phone: {spoken_digits(phone)}." if phone else "No caller ID phone."
+    if not patient:
+        return f"{phone_line} No matching patient record. Do not mention this; continue fresh booking flow."
+    last = history[0] if history else None
+    next_appt = appointments[0] if appointments else None
+    parts = [
+        f"{phone_line} Registered caller appears to be {patient.get('name')}.",
+        "Do not greet with the name until the caller confirms it.",
+    ]
+    if last:
+        parts.append(
+            "Last visit: "
+            f"{friendly_date(last.get('appointment_date'))} with {last.get('doctor_name')} "
+            f"at {friendly_time(last.get('appointment_time'))}."
+        )
+    if next_appt:
+        parts.append(
+            "Upcoming appointment: "
+            f"ID {spoken_digits(next_appt.get('appointment_id'))}, "
+            f"{friendly_date(next_appt.get('appointment_date'))} at {friendly_time(next_appt.get('appointment_time'))} "
+            f"with {next_appt.get('doctor_name')}."
+        )
+    return " ".join(parts)
+
+
+def summarize_call_from_transcripts(transcripts: list[dict], preloaded_user: dict | None, room_name: str | None) -> dict:
+    final_text = " ".join(
+        item["text"] for item in transcripts
+        if item.get("role") == "user" and item.get("final") and item.get("text")
+    ).strip()
+    lowered = final_text.lower()
+    negative_markers = ("angry", "upset", "complaint", "bad", "not working", "delay", "wrong", "cancel")
+    follow_markers = ("call back", "callback", "complaint", "urgent", "emergency", "doctor call", "human", "staff")
+    if not final_text:
+        sentiment = "unknown"
+        summary = "Call ended without a completed caller transcript."
+    else:
+        sentiment = "negative" if any(marker in lowered for marker in negative_markers) else "neutral"
+        summary = final_text[:280]
+    patient = (preloaded_user or {}).get("patient") or {}
+    return {
+        "room_name": room_name,
+        "caller_phone": (preloaded_user or {}).get("caller_phone"),
+        "patient_id": patient.get("patient_id"),
+        "call_summary": summary,
+        "user_sentiment": sentiment,
+        "follow_up_required": any(marker in lowered for marker in follow_markers),
+        "turn_count": len([item for item in transcripts if item.get("role") == "user" and item.get("final")]),
+    }
+
+
+async def save_post_call_report(report: dict) -> None:
+    started = time.perf_counter()
+    try:
+        report_id = await asyncio.to_thread(db_helper.save_call_report, report)
+        pipeline_event(
+            "tools",
+            "ok",
+            "Post-call report saved",
+            "Structured call report persisted after disconnect",
+            event="post_call_report_saved",
+            report_id=report_id,
+            follow_up_required=bool(report.get("follow_up_required")),
+            sentiment=report.get("user_sentiment"),
+            duration_ms=round((time.perf_counter() - started) * 1000, 2),
+        )
+    except Exception as exc:
+        pipeline_event(
+            "tools",
+            "error",
+            "Post-call report failed",
+            str(exc),
+            event="post_call_report_failed",
+            traceback=traceback.format_exc(),
+        )
+
+
 def env_list(name: str, defaults: list[str]) -> list[str]:
     raw = os.getenv(name)
     if not raw:
         return defaults
     values = [item.strip() for item in raw.split(",") if item.strip()]
     return values or defaults
+
+
+def groq_api_keys() -> list[str]:
+    keys: list[str] = []
+    raw_multi = os.getenv("GROQ_API_KEYS")
+    if raw_multi:
+        keys.extend(item.strip() for item in raw_multi.split(",") if item.strip())
+    for name in ("GROQ_API_KEY", "GROQ_API_KEY_1", "GROQ_API_KEY_2", "GROQ_API_KEY_3"):
+        value = os.getenv(name)
+        if value:
+            keys.append(value.strip())
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(key)
+    return deduped
 
 
 def required_env(name: str) -> str:
@@ -841,6 +1111,8 @@ def env_diagnostics() -> dict[str, dict[str, object]]:
         "SIXTY_DB_API_KEY",
         "CARTESIA_API_KEY",
         "OPENAI_API_KEY",
+        "GROQ_API_KEY",
+        "GROQ_API_KEYS",
         "ASSEMBLYAI_API_KEY",
         "DEEPGRAM_API_KEY",
         "LIVEKIT_URL",
@@ -885,11 +1157,24 @@ async def say_progress(ctx: RunContext, text: str | None = None) -> None:
 async def run_db_step(tool_name: str, operation: str, fn, *args):
     started = time.perf_counter()
     pipeline_event("tools", "info", f"{tool_name} start", operation)
+    timeout_s = float(os.getenv("DB_TOOL_TIMEOUT_SECONDS", "2.0"))
     try:
-        result = await asyncio.to_thread(fn, *args)
+        result = await asyncio.wait_for(asyncio.to_thread(fn, *args), timeout=timeout_s)
         duration_ms = round((time.perf_counter() - started) * 1000, 2)
         pipeline_event("tools", "ok", f"{tool_name} done", operation, duration_ms=duration_ms)
         return result
+    except asyncio.TimeoutError as exc:
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        pipeline_event(
+            "tools",
+            "error",
+            f"{tool_name} timeout",
+            f"{operation} exceeded {timeout_s:.1f}s",
+            duration_ms=duration_ms,
+            event="db_lookup_timeout",
+            timeout_s=timeout_s,
+        )
+        raise asyncio.TimeoutError(f"{operation} timed out after {timeout_s:.1f}s") from exc
     except Exception as exc:
         duration_ms = round((time.perf_counter() - started) * 1000, 2)
         pipeline_event(
@@ -1139,6 +1424,44 @@ async def book_appointment(ctx: RunContext, name: str, phone: str, doctor_name: 
         raise llm.ToolError("Something went wrong on our side while booking. Apologise and try once more.")
 
 @llm.function_tool
+async def reschedule_appointment(ctx: RunContext, appointment_id: int, new_date: str, new_time: str) -> str:
+    """Moves an existing appointment to a new date (YYYY-MM-DD) and time in ONE step -
+    use this when the caller changes the time, including right after booking in the
+    same call. Never cancel-and-rebook for a time change."""
+    if not db_helper.is_clinic_open(new_date):
+        return _SUNDAY_MESSAGE
+
+    await say_progress(ctx)
+
+    slot_time = parse_time_to_24h(new_time) or new_time
+    try:
+        ok, reason = await run_db_step(
+            "reschedule_appointment",
+            "db_helper.reschedule_appointment",
+            db_helper.reschedule_appointment,
+            appointment_id,
+            new_date,
+            slot_time,
+        )
+        await slot_cache.refresh()
+        if ok:
+            return (
+                f"Rescheduled. Appointment ID {appointment_id} is now on "
+                f"{friendly_date(new_date)} at {friendly_time(slot_time)}. Confirm it back to the caller."
+            )
+        if reason == "not_found":
+            return "No scheduled appointment with that ID. Verify the appointment first."
+        nearest = slot_cache.nearest(None, new_date, slot_time, k=3)
+        options = "; ".join(_slot_phrase(s) for s in nearest) if nearest else "none nearby"
+        if reason == "doctor_unavailable":
+            return f"The doctor is not available at that new time. The original booking is UNCHANGED. Nearest alternatives: {options}."
+        return f"That new time is already booked. The original booking is UNCHANGED. Nearest alternatives: {options}."
+    except Exception as exc:
+        log_tool_failure("reschedule_appointment", exc)
+        raise llm.ToolError("Something went wrong on our side while changing the time. The original booking is safe. Apologise and try once more.")
+
+
+@llm.function_tool
 async def cancel_appointment(ctx: RunContext, appointment_id: int, reason: str = "") -> str:
     """Cancels a scheduled appointment by its ID and frees the slot. Pass the caller's
     cancellation reason if the caller chose to share one; leave it empty otherwise."""
@@ -1256,14 +1579,8 @@ class LockedSpeechStream(assemblyai.SpeechStream):
             "keyterms_prompt": json.dumps(self._opts.keyterms_prompt)
             if is_given(self._opts.keyterms_prompt)
             else None,
-            # Do not send a custom language_code here. Universal Streaming v3
-            # handles code-switching internally, and the official LiveKit plugin
-            # does not include language_code in this websocket config. Sending
-            # unsupported query params caused AssemblyAI to emit an immediate
-            # Error frame and forced slow Deepgram fallback on live calls.
-            "language_detection": self._opts.language_detection
-            if is_given(self._opts.language_detection)
-            else None,
+            "language_detection": "false",  # Disable auto-detection to prevent French/Portuguese detection
+            "language_code": os.getenv("STT_LANGUAGE", "en-IN"),  # Lock to target language (e.g. en-IN)
             "prompt": self._opts.prompt if is_given(self._opts.prompt) else None,
             "agent_context": self._opts.agent_context
             if is_given(self._opts.agent_context)
@@ -1332,95 +1649,196 @@ class LockedAssemblyAISTT(assemblyai.STT):
 
 
 def build_stt() -> stt.STT:
+    """Primary AssemblyAI Universal 3 Pro with Deepgram fallback.
+
+    AssemblyAI can occasionally close a streaming socket with status 3006.
+    That failure is retryable at the provider level, but if the raw STT is
+    passed directly into AgentSession the session receives a fatal stt_error.
+    Keep AssemblyAI as the high-accuracy path and wrap it with Deepgram so the
+    call stays alive during transient AssemblyAI stream failures.
+    """
     key_terms = env_list("STT_KEY_TERMS", CLINIC_KEY_TERMS)
 
-    assemblyai_stt = LockedAssemblyAISTT(
+    min_turn_silence = max(60, min(int(os.getenv("ASSEMBLYAI_MIN_TURN_SILENCE", "90")), 180))
+    max_turn_silence = max(180, min(int(os.getenv("ASSEMBLYAI_MAX_TURN_SILENCE", "320")), 500))
+    interruption_delay = max(80, min(int(os.getenv("ASSEMBLYAI_INTERRUPTION_DELAY", "120")), 250))
+    primary = LockedAssemblyAISTT(
         api_key=required_env("ASSEMBLYAI_API_KEY"),
         model=os.getenv("ASSEMBLYAI_STT_MODEL", "universal-3-5-pro"),
+        language_detection=env_flag("ASSEMBLYAI_LANGUAGE_DETECTION", False),
         keyterms_prompt=key_terms,
+        prompt=os.getenv(
+            "ASSEMBLYAI_TRANSCRIPT_PROMPT",
+            "Transcribe MyStree Clinic callers in clear Latin script. "
+            "Expect Indian English, Bengaluru English, Hinglish, and clinic booking terms. "
+            "Keep English words in English letters. Important terms: MyStree, Indiranagar, "
+            "appointment, booking, follow-up, gynaecology, fertility, pregnancy, scan, Angel.",
+        ),
         format_turns=True,
-        # Aggressive finalization: live calls showed 0.5-1.3s transcript_delay,
-        # which dominates end-of-utterance latency. Finalize confident turns
-        # after 160ms of silence and cap the wait for unconfident ones.
-        end_of_turn_confidence_threshold=float(os.getenv("ASSEMBLYAI_EOT_CONFIDENCE", "0.5")),
-        min_turn_silence=int(os.getenv("ASSEMBLYAI_MIN_TURN_SILENCE", "160")),
-        max_turn_silence=int(os.getenv("ASSEMBLYAI_MAX_TURN_SILENCE", "650")),
-        interruption_delay=int(os.getenv("ASSEMBLYAI_INTERRUPTION_DELAY", "250")),
+        end_of_turn_confidence_threshold=float(os.getenv("ASSEMBLYAI_EOT_CONFIDENCE", "0.35")),
+        min_turn_silence=min_turn_silence,
+        max_turn_silence=max_turn_silence,
+        interruption_delay=interruption_delay,
         mode=os.getenv("ASSEMBLYAI_MODE", "min_latency"),
     )
 
-    deepgram_stt = deepgram.STT(
-        api_key=required_env("DEEPGRAM_API_KEY"),
-        model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
+    deepgram_key = os.getenv("DEEPGRAM_API_KEY")
+    if not deepgram_key:
+        pipeline_event(
+            "stt",
+            "warn",
+            "Deepgram fallback unavailable",
+            "DEEPGRAM_API_KEY missing; AssemblyAI will run without STT fallback",
+            model=os.getenv("ASSEMBLYAI_STT_MODEL", "universal-3-5-pro"),
+        )
+        return primary
+
+    deepgram_model = os.getenv("DEEPGRAM_STT_MODEL", "nova-3")
+    fallback = deepgram.STT(
+        api_key=deepgram_key,
+        model=deepgram_model,
         language=os.getenv("DEEPGRAM_LANGUAGE", "en-IN"),
+        detect_language=env_flag("DEEPGRAM_DETECT_LANGUAGE", False),
+        interim_results=True,
+        punctuate=True,
         smart_format=True,
-        keyterm=key_terms,
-        numerals=True,
+        no_delay=True,
+        endpointing_ms=max(10, min(int(os.getenv("DEEPGRAM_ENDPOINTING_MS", "80")), 300)),
+        filler_words=True,
+        keyterm=key_terms[:50],
     )
 
-    return stt.FallbackAdapter(
-        [assemblyai_stt, deepgram_stt],
-        attempt_timeout=float(os.getenv("STT_FALLBACK_ATTEMPT_TIMEOUT", "4")),
-        max_retry_per_stt=int(os.getenv("STT_FALLBACK_RETRIES", "0")),
-        retry_interval=float(os.getenv("STT_FALLBACK_RETRY_INTERVAL", "0.25")),
+    adapter = stt.FallbackAdapter(
+        [primary, fallback],
+        attempt_timeout=float(os.getenv("STT_FALLBACK_ATTEMPT_TIMEOUT", "4.0")),
+        max_retry_per_stt=int(os.getenv("STT_FALLBACK_MAX_RETRY_PER_PROVIDER", "1")),
+        retry_interval=float(os.getenv("STT_FALLBACK_RETRY_INTERVAL", "0.35")),
     )
+
+    @adapter.on("stt_availability_changed")
+    def _on_stt_availability_changed(ev):
+        provider = getattr(ev, "stt", None) or getattr(ev, "provider", None) or getattr(ev, "label", None)
+        available = getattr(ev, "available", None)
+        pipeline_event(
+            "stt",
+            "warn" if available is False else "ok",
+            "STT provider availability changed",
+            f"{provider or 'provider'} available={available}",
+            event="stt_availability_changed",
+            provider=str(provider),
+            available=available,
+        )
+
+    pipeline_event(
+        "stt",
+        "info",
+        "STT fallback chain configured",
+        "AssemblyAI Universal 3 Pro primary; Deepgram fallback catches retryable stream closures",
+        primary_model=os.getenv("ASSEMBLYAI_STT_MODEL", "universal-3-5-pro"),
+        fallback_model=deepgram_model,
+        min_turn_silence=min_turn_silence,
+        max_turn_silence=max_turn_silence,
+        interruption_delay=interruption_delay,
+        eot_confidence=float(os.getenv("ASSEMBLYAI_EOT_CONFIDENCE", "0.35")),
+        key_terms_count=len(key_terms),
+        attempt_timeout=float(os.getenv("STT_FALLBACK_ATTEMPT_TIMEOUT", "4.0")),
+        retry_interval=float(os.getenv("STT_FALLBACK_RETRY_INTERVAL", "0.35")),
+    )
+    return adapter
 
 
 def build_llm() -> llm.LLM:
-    fallback_chain: list[llm.LLM] = []
+    """Production-safe LLM fallback chain.
 
-    groq_key = os.getenv("GROQ_API_KEY")
-    groq_llm = None
-    if groq_key:
-        groq_llm = openai.LLM(
-            model=os.getenv("GROQ_LLM_MODEL") or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-            base_url=os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
-            api_key=groq_key,
-        )
-
-    openai_llm = openai.LLM(
-        model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
-        api_key=required_env("OPENAI_API_KEY"),
-    )
-
-    # Groq gives materially lower TTFT for short receptionist replies. Keep a
-    # tight fallback timeout so rate limits/network stalls hand off to OpenAI
-    # quickly instead of adding several seconds to the caller's turn.
-    if groq_llm is not None and env_flag("GROQ_PRIMARY", True):
-        pipeline_event(
-            "llm", "info", "Groq primary",
-            "Using Groq as primary low-latency LLM (GROQ_PRIMARY=true)",
-            model=os.getenv("GROQ_LLM_MODEL") or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-        )
-        fallback_chain.extend([groq_llm, openai_llm])
-    else:
-        pipeline_event(
-            "llm", "info", "OpenAI primary",
-            "OpenAI is primary; Groq kept as fallback"
-            + ("" if groq_llm is not None else " (no GROQ_API_KEY)"),
-            model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
-        )
-        fallback_chain.append(openai_llm)
-        if groq_llm is not None:
-            fallback_chain.append(groq_llm)
-
-    gemini_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    if google is not None and gemini_key:
-        fallback_chain.append(
-            google.LLM(
-                model=os.getenv("GEMINI_LLM_MODEL", "gemini-2.5-flash"),
-                api_key=gemini_key,
+    Groq can be very fast on raw requests, but the on-demand tier has a low
+    tokens-per-minute limit. The full clinic prompt is often 3k-4k tokens, so
+    Groq should only be primary when GROQ_PRIMARY=true and the account tier can
+    handle production traffic. OpenAI is the stable production path otherwise.
+    """
+    providers: list[llm.LLM] = []
+    groq_providers: list[llm.LLM] = []
+    groq_keys = groq_api_keys()
+    groq_model = os.getenv("GROQ_LLM_MODEL", "llama-3.1-8b-instant")
+    groq_base_url = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+    for index, groq_key in enumerate(groq_keys, start=1):
+        groq_providers.append(
+            openai.LLM(
+                model=groq_model,
+                api_key=groq_key,
+                base_url=groq_base_url,
+                max_completion_tokens=int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "60")),
+                temperature=float(os.getenv("LLM_TEMPERATURE", "0.25")),
+                max_retries=0,
             )
         )
-    elif os.getenv("GEMINI_API_KEY"):
-        logger.warning("GEMINI_API_KEY is set, but livekit.plugins.google is not installed.")
-        pipeline_event("llm", "warn", "Gemini unavailable", "Gemini key is set but plugin is not installed")
+        pipeline_event(
+            "llm",
+            "info",
+            "Groq key configured",
+            f"Groq primary key slot {index} configured",
+            provider="groq",
+            model=groq_model,
+            key_slot=index,
+        )
 
+    openai_model = os.getenv("OPENAI_LLM_MODEL", os.getenv("LLM_MODEL", "gpt-4o-mini"))
+    openai_fallback = openai.LLM(
+        model=openai_model,
+        api_key=required_env("OPENAI_API_KEY"),
+        max_completion_tokens=int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "60")),
+        temperature=float(os.getenv("LLM_TEMPERATURE", "0.25")),
+        max_retries=0,
+    )
+
+    groq_primary = env_flag("GROQ_PRIMARY", False)
+    if groq_primary and groq_providers:
+        providers.extend(groq_providers)
+        providers.append(openai_fallback)
+        chain_label = "Groq primary + OpenAI fallback"
+        chain_message = "Groq keys are tried first; OpenAI gpt-4o-mini is the final stable fallback"
+        primary_provider = "groq"
+        fallback_provider = "openai"
+        fallback_model = openai_model
+    else:
+        providers.append(openai_fallback)
+        providers.extend(groq_providers)
+        chain_label = "OpenAI primary + Groq fallback"
+        chain_message = (
+            "OpenAI is primary for production stability; Groq remains fallback/test path "
+            "because current Groq tier rate-limits the full clinic prompt"
+        )
+        primary_provider = "openai"
+        fallback_provider = "groq"
+        fallback_model = groq_model
+
+    if not groq_providers:
+        pipeline_event(
+            "llm",
+            "warn",
+            "OpenAI primary",
+            "No Groq API keys found; OpenAI is serving as primary",
+            provider="openai",
+            model=openai_model,
+        )
+        return openai_fallback
+
+    pipeline_event(
+        "llm",
+        "info",
+        chain_label,
+        chain_message,
+        primary_provider=primary_provider,
+        groq_model=groq_model,
+        groq_key_count=len(groq_keys),
+        fallback_provider=fallback_provider,
+        fallback_model=fallback_model,
+        attempt_timeout=float(os.getenv("LLM_FALLBACK_ATTEMPT_TIMEOUT", "2.0")),
+    )
     adapter = llm.FallbackAdapter(
-        fallback_chain,
-        attempt_timeout=float(os.getenv("LLM_FALLBACK_ATTEMPT_TIMEOUT", "2.5")),
+        providers,
+        attempt_timeout=float(os.getenv("LLM_FALLBACK_ATTEMPT_TIMEOUT", "2.0")),
         max_retry_per_llm=int(os.getenv("LLM_FALLBACK_RETRIES", "0")),
-        retry_interval=float(os.getenv("LLM_FALLBACK_RETRY_INTERVAL", "0.15")),
+        retry_interval=float(os.getenv("LLM_FALLBACK_RETRY_INTERVAL", "0.1")),
     )
 
     @adapter.on("llm_availability_changed")
@@ -1430,73 +1848,14 @@ def build_llm() -> llm.LLM:
             pipeline_event("llm", "ok", "LLM recovered", f"{provider} available again", provider=str(provider))
         else:
             pipeline_event(
-                "llm",
-                "warn",
-                "LLM fallback used",
-                f"{provider} unavailable (likely rate limit); switching to next LLM",
-                event="llm_fallback_used",
-                provider=str(provider),
+                "llm", "warn", "LLM fallback used",
+                f"{provider} unavailable; failing over to next configured LLM",
+                event="llm_fallback_used", provider=str(provider),
             )
 
     return adapter
 
 
-def _provider_slug(provider: tts.TTS) -> str:
-    label = getattr(provider, "label", "").lower()
-    name = type(provider).__name__.lower()
-    if "kitten" in label or "kitten" in name:
-        return "kitten"
-    if "60db" in label or "sixtydb" in name:
-        return "60db"
-    if "sarvam" in label or "sarvam" in name:
-        return "sarvam"
-    if "openai" in label or "openai" in name:
-        return "openai"
-    return getattr(provider, "provider", "unknown") or "unknown"
-
-
-def _attach_tts_fallback_logging(adapter: tts.TTS, chain: list[tts.TTS]) -> None:
-    order = [_provider_slug(provider) for provider in chain]
-
-    def _next_provider_after(failed: str) -> str:
-        if failed in order:
-            idx = order.index(failed)
-            if idx + 1 < len(order):
-                return order[idx + 1]
-        return "none"
-
-    @adapter.on("tts_availability_changed")
-    def _on_tts_availability_changed(ev):
-        global _use_phonetic_fallback
-        provider_slug = _provider_slug(getattr(ev, "tts", None))
-        is_available = getattr(ev, "available", True)
-        
-        if is_available:
-            if provider_slug == "sarvam":
-                _use_phonetic_fallback = False
-            return
-            
-        failed = provider_slug
-        next_provider = _next_provider_after(failed)
-        if next_provider == "none":
-            return
-            
-        if next_provider != "sarvam":
-            _use_phonetic_fallback = True
-            
-        message = f"LOUD WARNING: TTS FALLBACK USED: {failed} -> {next_provider}"
-        print(message)
-        logger.warning(message)
-        pipeline_event(
-            "tts",
-            "warn",
-            "TTS fallback used",
-            message,
-            event="tts_fallback_used",
-            provider=next_provider,
-            failed_provider=failed,
-            order=order,
-        )
 # Validated against the live Sarvam API (2026-07-07): full bulbul:v3 speaker list.
 SARVAM_V3_SPEAKERS = {
     "aditya", "ritu", "ashutosh", "priya", "neha", "rahul", "pooja", "rohan",
@@ -1507,63 +1866,18 @@ SARVAM_V3_SPEAKERS = {
 }
 
 
-def build_tts(prewarmed_kitten_tts=None, sarvam_speaker_override: str | None = None) -> tts.TTS:
+def _build_sarvam_tts(voice_id: str | None, pace_override: float | None = None) -> tts.TTS:
     diagnostics = env_diagnostics()
     pipeline_event(
-        "tts",
-        "info",
-        "TTS env check",
-        "Checking TTS credentials visible to worker process",
+        "tts", "info", "TTS env check",
+        "Checking Sarvam credentials visible to worker process",
         sarvam=diagnostics["SARVAM_API_KEY"],
-        cartesia=diagnostics["CARTESIA_API_KEY"],
-        openai=diagnostics["OPENAI_API_KEY"],
-        sixtydb=diagnostics.get("SIXTY_DB_API_KEY"),
     )
-
-    fallback_chain: list[tts.TTS] = []
-
-    if env_flag("USE_60DB_TTS", False):
-        if SixtyDbTTS is None:
-            pipeline_event("tts", "warn", "60db unavailable", "60db wrapper could not be imported; keeping Sarvam primary")
-        elif not os.getenv("SIXTY_DB_API_KEY"):
-            pipeline_event("tts", "warn", "60db missing key", "USE_60DB_TTS=true but SIXTY_DB_API_KEY is missing; keeping Sarvam primary")
-        else:
-            voice_id = os.getenv("SIXTY_DB_VOICE_ID", "fbb75ed2-975a-40c7-9e06-38e30524a9a1")
-            sample_rate = int(os.getenv("SIXTY_DB_TTS_SAMPLE_RATE", "24000"))
-            pipeline_event(
-                "tts",
-                "info",
-                "60db Indian voice config",
-                "Adding 60db as experimental primary Indian female TTS",
-                provider="60db.ai",
-                voice_id=voice_id,
-                voice_name=os.getenv("SIXTY_DB_VOICE_NAME", "Zara"),
-                sample_rate=sample_rate,
-                ws_url=os.getenv("SIXTY_DB_TTS_URL", "wss://api.60db.ai/ws/tts"),
-                speed=float(os.getenv("SIXTY_DB_TTS_SPEED", "1.04")),
-                stability=int(os.getenv("SIXTY_DB_TTS_STABILITY", "45")),
-                similarity=int(os.getenv("SIXTY_DB_TTS_SIMILARITY", "78")),
-            )
-            fallback_chain.append(
-                SixtyDbTTS(
-                    api_key=required_env("SIXTY_DB_API_KEY"),
-                    voice_id=voice_id,
-                    ws_url=os.getenv("SIXTY_DB_TTS_URL", "wss://api.60db.ai/ws/tts"),
-                    sample_rate=sample_rate,
-                    speed=float(os.getenv("SIXTY_DB_TTS_SPEED", "1.04")),
-                    stability=int(os.getenv("SIXTY_DB_TTS_STABILITY", "45")),
-                    similarity=int(os.getenv("SIXTY_DB_TTS_SIMILARITY", "78")),
-                    min_buffer_size=int(os.getenv("SIXTY_DB_MIN_BUFFER_SIZE", "28")),
-                    max_chunk_length=int(os.getenv("SIXTY_DB_MAX_CHUNK_LENGTH", "140")),
-                )
-            )
-    elif os.getenv("SIXTY_DB_API_KEY"):
-        pipeline_event("tts", "info", "60db configured", "60db key is present but USE_60DB_TTS=false, so Sarvam remains primary")
 
     sarvam_model = force_bulbul_v3()
     sarvam_speaker = os.getenv("SARVAM_SPEAKER", "ishita")
-    if sarvam_speaker_override:
-        requested = sarvam_speaker_override.strip().lower()
+    if voice_id:
+        requested = voice_id.strip().lower()
         if requested in SARVAM_V3_SPEAKERS:
             sarvam_speaker = requested
             pipeline_event(
@@ -1575,16 +1889,21 @@ def build_tts(prewarmed_kitten_tts=None, sarvam_speaker_override: str | None = N
                 "tts", "warn", "Voice override rejected",
                 f"Unknown Sarvam bulbul:v3 speaker '{requested}'; using {sarvam_speaker}",
             )
+
     sarvam_language = os.getenv("SARVAM_LANGUAGE_CODE", "en-IN")
     sarvam_base_url = os.getenv("SARVAM_BASE_URL", "https://api.sarvam.ai")
-    sarvam_pace = float(os.getenv("SARVAM_PACE", "1.0"))
+    # Rest-of-call pace defaults faster than natural (1.0) - per-minute call
+    # cost matters, and this is the pace used for every LLM turn after the
+    # greeting. The greeting itself uses a separate, slower pace - see
+    # _build_greeting_tts and SARVAM_PACE_GREETING.
+    sarvam_pace = pace_override if pace_override is not None else float(os.getenv("SARVAM_PACE", "1.08"))
     sarvam_min_buffer_size = int(os.getenv("SARVAM_MIN_BUFFER_SIZE", "35"))
     sarvam_max_chunk_length = int(os.getenv("SARVAM_MAX_CHUNK_LENGTH", "160"))
     pipeline_event(
         "tts",
         "info",
-        "Sarvam Indian voice config",
-        "Adding Sarvam Bulbul V3 as Indian voice fallback",
+        "Sarvam TTS provider",
+        "Sarvam Bulbul V3 - no fallback chain (production), token-by-token streaming",
         model=sarvam_model,
         speaker=sarvam_speaker,
         language=sarvam_language,
@@ -1593,112 +1912,97 @@ def build_tts(prewarmed_kitten_tts=None, sarvam_speaker_override: str | None = N
         min_buffer_size=sarvam_min_buffer_size,
         max_chunk_length=sarvam_max_chunk_length,
     )
-    fallback_chain.append(
-        SarvamTTS(
-            api_key=required_env("SARVAM_API_KEY"),
-            model=sarvam_model,
-            speaker=sarvam_speaker,
-            target_language_code=sarvam_language,
-            base_url=sarvam_base_url,
-            pace=sarvam_pace,
-            min_buffer_size=sarvam_min_buffer_size,
-            max_chunk_length=sarvam_max_chunk_length,
-        )
+    provider = SarvamTTS(
+        api_key=required_env("SARVAM_API_KEY"),
+        model=sarvam_model,
+        speaker=sarvam_speaker,
+        target_language_code=sarvam_language,
+        base_url=sarvam_base_url,
+        pace=sarvam_pace,
+        min_buffer_size=sarvam_min_buffer_size,
+        max_chunk_length=sarvam_max_chunk_length,
     )
-
-    if KittenLocalTTS is not None and env_flag("KITTEN_TTS_ENABLED", False):
-        kitten_tts = prewarmed_kitten_tts or KittenLocalTTS(
-            model_name=os.getenv("KITTEN_TTS_MODEL", "KittenML/kitten-tts-nano-0.8"),
-            voice=os.getenv("KITTEN_TTS_VOICE", "Bella"),
-            speed=float(os.getenv("KITTEN_TTS_SPEED", "1.0")),
-            cache_dir=os.getenv("KITTEN_TTS_CACHE_DIR") or None,
-            backend=os.getenv("KITTEN_TTS_BACKEND", "cpu") or None,
-            clean_text=env_flag("KITTEN_TTS_CLEAN_TEXT", True),
-            first_frame_timeout=float(os.getenv("KITTEN_TTS_TTFB_TIMEOUT", "3.0")),
-        )
-        pipeline_event(
-            "tts",
-            "info",
-            "KittenTTS config",
-            "Adding streaming local KittenTTS as fallback only; Sarvam is primary for Indian voice quality",
-            model=kitten_tts.model,
-            voice=os.getenv("KITTEN_TTS_VOICE", "Bella"),
-            speed=float(os.getenv("KITTEN_TTS_SPEED", "1.0")),
-            streaming=kitten_tts.capabilities.streaming,
-        )
-        try:
-            prewarm_started = time.perf_counter()
-            if prewarmed_kitten_tts is None:
-                kitten_tts.prewarm()
-            pipeline_event(
-                "tts",
-                "ok",
-                "KittenTTS ready",
-                "Local streaming KittenTTS fallback model loaded and ready",
-                duration_ms=round((time.perf_counter() - prewarm_started) * 1000, 2),
-                streaming=kitten_tts.capabilities.streaming,
-            )
-            fallback_chain.append(kitten_tts)
-        except Exception as exc:
-            pipeline_event(
-                "tts",
-                "error",
-                "KittenTTS prewarm failed",
-                str(exc),
-                error=exc,
-                traceback=traceback.format_exc(),
-            )
+    if provider.capabilities.streaming:
+        pipeline_event("tts", "ok", "Streaming TTS path", "AgentSession will use token-by-token TTS.stream()", streaming=True)
     else:
-        pipeline_event(
-            "tts",
-            "warn",
-            "KittenTTS unavailable",
-            "KittenTTS disabled or package unavailable; using remote TTS providers",
-            enabled=env_flag("KITTEN_TTS_ENABLED", False),
-            package_available=KittenLocalTTS is not None,
-        )
+        pipeline_event("tts", "warn", "Non-streaming TTS path", "Sarvam wrapper is not exposing streaming capability")
+    return provider
 
+
+def _build_rumik_tts(voice_id: str | None) -> tts.TTS:
+    resolved_voice = voice_id if voice_id in RUMIK_VOICES else voice_catalog_default("rumik")
+    voice_meta = RUMIK_VOICES.get(resolved_voice, {})
     pipeline_event(
-        "tts",
-        "warn",
-        "Cartesia removed",
-        "Cartesia skipped: 402 Payment Required during direct probe; re-add after billing fixed",
-        cartesia_key_present=bool(os.getenv("CARTESIA_API_KEY")),
+        "tts", "info", "Rumik TTS provider",
+        f"Rumik Silk {RUMIK_DEFAULT_MODEL} - no fallback chain, description-steered voice",
+        model=RUMIK_DEFAULT_MODEL, voice_id=resolved_voice, voice_name=voice_meta.get("name"),
+    )
+    return RumikTTS(
+        api_key=required_env("RUMIK_API_KEY"),
+        description=voice_meta.get("description"),
+        model=RUMIK_DEFAULT_MODEL,
     )
 
+
+def _build_smallest_tts(voice_id: str | None, speed_override: float | None = None) -> tts.TTS:
+    resolved_voice = voice_id if voice_id in SMALLEST_VOICES else voice_catalog_default("smallest")
+    voice_meta = SMALLEST_VOICES.get(resolved_voice, {})
     pipeline_event(
-        "tts",
-        "info",
-        "OpenAI TTS config",
-        "Adding OpenAI TTS as final last-resort fallback",
-        model=os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts"),
-        voice=os.getenv("OPENAI_TTS_VOICE", "ash"),
+        "tts", "info", "Smallest.ai TTS provider",
+        f"Smallest.ai {SMALLEST_DEFAULT_MODEL} - no fallback chain, sentence-level synthesis",
+        model=SMALLEST_DEFAULT_MODEL, voice_id=resolved_voice, voice_name=voice_meta.get("name"),
     )
-    fallback_chain.append(
-        openai.TTS(
-            model=os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts"),
-            voice=os.getenv("OPENAI_TTS_VOICE", "ash"),
-            api_key=required_env("OPENAI_API_KEY"),
-            response_format="pcm",
-        )
+    # Rest-of-call speed defaults slightly over 1.0 - per-minute call cost
+    # matters, and this is the speed used for every LLM turn after the
+    # greeting. The greeting itself uses a separate, slower speed - see
+    # _build_greeting_tts and SMALLEST_SPEED_GREETING.
+    speed = speed_override if speed_override is not None else float(os.getenv("SMALLEST_SPEED", "1.05"))
+    return SmallestTTS(
+        api_key=required_env("SMALLEST_API_KEY"),
+        voice_id=resolved_voice,
+        model=SMALLEST_DEFAULT_MODEL,
+        sample_rate=SMALLEST_SAMPLE_RATE,
+        speed=speed,
     )
 
-    adapter = tts.FallbackAdapter(
-        fallback_chain,
-        max_retry_per_tts=int(os.getenv("TTS_FALLBACK_RETRIES", "0")),
-        sample_rate=24000,
-    )
-    _attach_tts_fallback_logging(adapter, fallback_chain)
-    if not adapter.capabilities.streaming:
-        pipeline_event(
-            "tts",
-            "warn",
-            "Non-streaming TTS path",
-            "TTS fallback adapter is not exposing streaming; AgentSession may fall back to chunked synthesis",
-        )
-    else:
-        pipeline_event("tts", "ok", "Streaming TTS path", "AgentSession will use TTS.stream()", streaming=True)
-    return adapter
+
+def build_tts(tts_provider: str = "smallest", voice_id: str | None = None) -> tts.TTS:
+    """Sole TTS provider per call, selectable from {sarvam, rumik, smallest}.
+
+    No FallbackAdapter, ever - a mid-call TTS provider switch changes the
+    voice the caller hears mid-sentence, which reads as far more broken than
+    a brief same-provider retry would. The provider is chosen once, before
+    the call starts (from dispatch/participant metadata - see
+    provider_and_voice_from_metadata), and stays fixed for the whole call.
+    Default is Smallest.ai/Maithili - the agent's default voice engine.
+    """
+    provider = (tts_provider or "smallest").strip().lower()
+    if provider not in TTS_PROVIDERS:
+        pipeline_event("tts", "warn", "Unknown TTS provider", f"'{provider}' is not configured; using Smallest.ai", requested=provider)
+        provider = "smallest"
+
+    if provider == "rumik":
+        return _build_rumik_tts(voice_id)
+    if provider == "smallest":
+        return _build_smallest_tts(voice_id)
+    return _build_sarvam_tts(voice_id)
+
+
+def _build_greeting_tts(provider: str, voice_id: str | None) -> tts.TTS | None:
+    """A short-lived, slower-paced TTS instance used only for the opening
+    greeting. Callers form a first impression from the first thing they
+    hear; the rest of the call runs at the faster pace from build_tts()
+    to keep per-minute call cost down. Returns None where the provider has
+    no speed/pace knob (Rumik) - the greeting then falls back to the
+    normal-speed session TTS, same as any other line.
+    """
+    if provider == "sarvam":
+        return _build_sarvam_tts(voice_id, pace_override=float(os.getenv("SARVAM_PACE_GREETING", "0.9")))
+    if provider == "smallest":
+        return _build_smallest_tts(voice_id, speed_override=float(os.getenv("SMALLEST_SPEED_GREETING", "0.88")))
+    return None
+
+
 def build_turn_handling() -> TurnHandlingOptions:
     turn_detection = "stt"
     if multilingual_model is not None and env_flag("ENABLE_MULTILINGUAL_TURN_DETECTOR", True):
@@ -1706,8 +2010,8 @@ def build_turn_handling() -> TurnHandlingOptions:
     elif MultilingualModel is None:
         logger.warning("livekit-agents-turn-detector is not installed; falling back to STT turn detection.")
 
-    min_delay = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.12"))
-    max_delay = float(os.getenv("MAX_ENDPOINTING_DELAY", "0.45"))
+    min_delay = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.05"))
+    max_delay = min(float(os.getenv("MAX_ENDPOINTING_DELAY", "1.2")), 1.2)
     pipeline_event(
         "turn",
         "info",
@@ -1716,6 +2020,7 @@ def build_turn_handling() -> TurnHandlingOptions:
         turn_detection=type(turn_detection).__name__ if turn_detection != "stt" else "stt",
         min_endpointing_delay=min_delay,
         max_endpointing_delay=max_delay,
+        hard_max_turn_silence_s=1.2,
         preemptive_generation=env_flag("PREEMPTIVE_GENERATION", True),
         preemptive_tts=env_flag("PREEMPTIVE_TTS", True),
     )
@@ -1740,7 +2045,7 @@ def build_turn_handling() -> TurnHandlingOptions:
             preemptive_tts=env_flag("PREEMPTIVE_TTS", True),
         ),
     )
-def build_initial_context() -> llm.ChatContext:
+def build_initial_context(preloaded_user: dict | None = None) -> llm.ChatContext:
     clinic_name = os.getenv("CLINIC_NAME", "MyStree Clinic")
     try:
         from zoneinfo import ZoneInfo
@@ -1772,42 +2077,20 @@ def build_initial_context() -> llm.ChatContext:
     initial_ctx.add_message(
         role="system",
         content=(
-            f"You are Meera, a warm, professional HUMAN receptionist at {clinic_name}, Indiranagar - a women's health clinic in Bengaluru. "
-            "Patient, gentle, never rushed. Never say you are an AI, robot, or assistant; if asked, answer naturally: 'No, I am Meera from reception here.'\n"
-            "LANGUAGE: Mirror the caller's latest language - Indian English by default; simple Hindi if the caller speaks Hindi; Hinglish if the caller mixes; back to English when the caller switches. "
-            "Bengaluru clinic English with a light touch: at most ONE of haan ji, theek hai, acha, or ji per reply, and only where a real receptionist would say it - most replies need none. "
-            "Vary your acknowledgements (sure, of course, right, okay then, done, ji) instead of repeating the same one. "
-            "No Americanisms (awesome, gotcha, sure thing), no um/hmm, no 'I understand your request'.\n"
-            "ADDRESSING: Do NOT use sir, madam, ma'am, brother, sister, beta, aunty, uncle, or gendered pronouns for the caller. Use neutral receptionist language: ji, please, thank you, sure, of course, right, okay, you. "
-            "Caller gender is an internal routing hint only. Infer it only from explicit title/pronoun/name/record when available; never ask 'are you male or female', never run extra checks for it, and never speak the inferred gender. If unsure, keep everything neutral. "
-            "If the caller explicitly asks you to call them sir or madam, then use it sparingly; otherwise avoid it completely.\n"
-            "SPEECH: Telephone only - plain spoken words. Never JSON, code, brackets, markdown, lists, parentheses, URLs; never read raw tool output - summarise in one sentence. "
-            "Phone numbers and IDs digit by digit with dashes (9-8-4-5). Times in words only: 'ten thirty in the morning', 'five o'clock in the evening' - never colons, 24-hour times, or AM/PM letters. Dates as 'Wednesday, eighth July'. "
-            "Max two short sentences per reply (three only for final confirmation). RULE OF ONE: acknowledge what the caller said, ask exactly one question, then wait. "
-            "If the caller says repeat, pardon, or phir se: repeat slower and simpler, never irritated.\n"
-            "NAMES - STRICT GUARDRAIL: Never speak ANY person's name the caller has not personally said in this call. Never guess, assume, or pick a name from anywhere else. "
-            "Ask carefully: 'May I have your name, please?' - listen fully, confirm it exactly once ('Just to confirm, your name is ..., correct?'), and only after a yes may you ever use it. NAME QUALITY GATE: never confirm or store a name if the heard value is doctor, Dr, madam, sir, booking, follow-up, appointment, phone, number, yes/no, or a single unclear syllable. If STT says 'My name is Dr.' or 'my name is doctor', say exactly: 'Sorry, I heard only doctor. Please say just your first name once more.' Do not guess. "
-            "If a phone lookup returns a registered name, do NOT announce it - ask 'And may I confirm your name, please?' and match silently. Then use 'you' or the confirmed name only in final confirmation. "
-            "Read the phone back digit by digit ONCE; if corrected, once more; then never repeat it.\n"
-            "PRIVACY: Never ask about symptoms or health details. You MAY ask which area is needed - gynaecology, pregnancy, fertility, skin, diet, scans, physiotherapy, yoga, or counselling - that is how you route the call. "
-            "Ask only: name, phone, area or doctor preference, preferred day and time. Never ask date of birth, never register during the call; booking auto-creates a light record when needed. If the caller volunteers a concern, use suggest_doctor - never probe deeper or repeat it back.\n"
-            "FLOW - funnel every call to a confirmed booking or follow-up; do not let it wander:\n"
-            "NEW BOOKING FAST PATH: name (confirm once) > phone (confirm once) > ask: particular doctor, or which area is needed > preferred date and time > find_slots; "
-            "if taken, offer the returned alternatives > confirm doctor, date and time in ONE sentence, wait for a clear yes > book > give appointment ID digit by digit.\n"
-            "FOLLOW-UP FAST PATH: ask name first > lookup_patient_history by name; if multiple/no match ask phone and retry. If a last visit is found, say only the last visit date and doctor, then ask: same doctor follow-up, or new booking? Then collect preferred date/time and book.\n"
-            "CANCEL (the moment the caller says cancel): verify phone > confirm WHICH appointment > ask once, gently: 'May I know the reason? Only if you are comfortable sharing.' > accept whatever is said, pass the reason to the tool > always offer once to rebook - rebooking is the best outcome.\n"
-            "ENQUIRY: answer in one sentence, then 'Shall I book an appointment for you?' UNCLEAR: re-ask in simpler words. EMERGENCY: send the caller to the nearest emergency hospital immediately.\n"
-            "SPEED TARGET: finish booking or follow-up in under two minutes when details are available. Do not sound rushed; sound calm but move one step forward every turn. HURRY (jaldi, urgent, asap, fastest, short rushed answers): use fastest_appointment immediately, offer the earliest slot, one-sentence replies.\n"
-            "FAILOVERS: no patient record or no previous visit > continue as a fresh booking, no DOB. Multiple name matches > ask phone once. Slot taken > offer the tool's alternatives, else another day or doctor. Nothing found on cancel or reschedule > say so, offer a new booking. Corrections > update, confirm once, resume.\n"
-            "TOOLS: find_slots, fastest_appointment, suggest_doctor, lookup_booking_timings are instant - no filler. Use lookup_patient_history for follow-up after name. Use book_appointment with name, phone, doctor, date, time; it handles new patients without DOB. Before book or lookup say one tiny filler: 'Haan ji, checking now.' "
-            "Never say database, system, tool, portal, or processing - say appointment diary, schedule, doctor's calendar. Max three tool calls per turn; on failure apologise softly ('Sorry, one small issue, ek minute') and retry once.\n"
-            "TRUTH: Never invent slots, prices, doctors, or details - only what tools return. Follow-up demo: if the caller says the name is Angel and gives 7-0-1-2-8-1-2-4-7-6, the old visit exists in the diary; use lookup_patient_history and offer same-doctor follow-up or new booking. "
-            "DOCTORS: the clinic has eleven specialists - never recite the full list. If the caller asks for all doctors, say 'We have specialists for almost everything - which area do you need?' and offer the areas; then suggest_doctor gives the right one or two names. "
-            "Verify phone before booking or cancelling; for follow-up history, name-first lookup is allowed, then phone only if needed. If booking fails because the slot was just taken, apologise once and offer the tool's nearest alternatives. Convert kal or next Monday to YYYY-MM-DD using the date context; confirm dates in words.\n"
-            "CLOSING: Ask once 'Is there anything else I can help you with?' When the caller says no - after a booking: 'Your appointment is confirmed, [name]. We look forward to seeing you at MyStree Clinic, Indiranagar. Thank you for calling, take care.'; "
-            "after a follow-up: 'Your follow-up is all set. Thank you for calling MyStree Clinic.'; after a cancellation: 'No problem at all, it is cancelled. Whenever you need us, we are here.' "
-            "Then call end_call - never before the goodbye is spoken.\n"
-            f"You already greeted: '{GREETING_TEXT}' - do not repeat it unless asked."
+            f"ROLE: You are Gracy, a warm, unhurried care coordinator for {clinic_name}, Indiranagar, Bengaluru. Goal: book gynecologist appointments by phone, like a real person, never rushed. Never say AI/assistant/robot; if asked, say 'I am Gracy from reception here.' You already greeted: '{GREETING_TEXT}' - do not repeat it.\n"
+            "STYLE: Indian English, gentle, warm. Cushion questions with a short warm lead-in (Oh, absolutely... / Sure, let me check... / Don't worry, we'll sort this...). Use commas and ellipses for natural breathing pauses - let sentences breathe, don't clip them so short they sound abrupt, but never pad with extra sentences either: every call is billed per minute, so say only what's needed for this one step, then stop and wait. Ask exactly one question, then wait - never double-ask. Acknowledge corrections warmly: 'Oh, got it...'. Mirror Hindi/Hinglish only if caller uses it. Avoid sir, madam, umm, hmm. If caller sounds anxious, reassure briefly first ('you're in safe hands') without any clinical claim. If interrupted or corrected, yield immediately and continue from there warmly.\n"
+            "SPEECH FORMAT: Plain spoken prose only - no bullets, lists, markdown, hashtags, headers, JSON, or technical words (database, system, tool, file, registry, cache) - say appointment diary, books, schedule instead. Phone/ID/OTP/age numbers digit-by-digit with dashes: 7-0-1-2. Times and dates in words. Bengaluru place names broken for clear TTS: Kora-mangala, Indira-nagar, Jaya-nagar, Malle-shwaram, Maratha-halli, White-field.\n"
+            "SAFETY: Never diagnose or give medical/diet/medicine advice; if asked, offer to connect them to the doctor. Never ask for detailed symptoms or DOB - only the broad area (gynaecology, pregnancy, fertility, skin, diet, scans, physio, yoga, counselling), and route on that, never on symptom detail or claim a doctor is 'perfect for' a symptom. Emergency: tell caller to go to the nearest hospital immediately.\n"
+            "IDENTITY FIRST (always, every call): collect name, then phone, as the very first two turns - before doctor, department, concern, or timing, even if caller already named a doctor or described their concern (acknowledge it warmly, then still get name and phone before any lookup tool). Ask name once, confirm once; if no record exists yet, say gently 'it looks like we're setting up a fresh profile for you, which is wonderful.' Reject bad names: doctor, dr, sir, madam, booking, phone, yes/no, unclear syllable. Ask phone as its own separate turn, track corrections like 'not X, Y', and repeat the final number back digit-by-digit for confirmation before booking.\n"
+            "O(1) CALL POLICY: Keep one state only: intent, name_confirmed, phone_confirmed, doctor_or_area, date_time, appointment_id. Each turn either fills the next missing field, calls one needed tool, or confirms. Do not branch into explanations.\n"
+            "OFF-TOPIC: For anything unrelated to their visit (chit-chat, traffic, gossip), acknowledge briefly in one line, then pivot straight back to booking - never leave the flow to keep chatting.\n"
+            "SILENCE: If caller pauses, never say 'are you there' - just wait warmly, they may be thinking.\n"
+            "BOOK: After name and phone are confirmed, ask their concern (broad area only - gynaecology, pregnancy, fertility, skin, diet, scans, physio, yoga, counselling) UNLESS they already named a specific doctor, in which case skip straight to that doctor. Either way, call lookup_doctors silently to match - never read out doctor names, specialties, or multiple options while matching, that is exactly the kind of extra talk time that runs up the bill. Go straight to lookup_booking_timings or find_slots and offer at most one or two slots. The doctor's name is said once, naturally, when offering the slot or at final confirmation - not before. After clear confirmation, instantly call book_appointment -> give ID digit-by-digit. In a hurry: use fastest_appointment.\n"
+            "FOLLOW-UP: After name and phone are confirmed, call lookup_patient_history. If found, mention only last visit date and doctor, then ask same doctor or new booking. No DOB or registration.\n"
+            "CHANGE/CANCEL: Verify phone first. Time/day change: reschedule_appointment, never cancel-and-rebook. Cancel: confirm appointment, ask reason once only if comfortable, call cancel_appointment, offer to rebook. Narrate live, no dead air: 'I am freeing that up now... okay, done.'\n"
+            "TOOLS: Never guess or invent slots, prices, doctors, IDs, or history - use only tool results. If slot is taken, offer returned alternatives; if unclear, ask one simpler question. Max three tool calls per turn; keep your own text minimal during lookups, filler audio covers the wait.\n"
+            "GOOD STYLE: 'Namaste... may I have your name, please?' 'Thank you... and the best number to reach you on?' 'Is this a new booking, or a follow-up?' 'And what's the concern today - gynaecology, pregnancy, fertility, or something else?' 'Let's see... I have a slot tomorrow morning at eleven thirty with Dr. Priya, or four in the evening - which suits you?' 'Wonderful, that's all booked for you.'\n"
+            "CLOSE: After helping, ask once if anything else. If no, warmly confirm their details one last time, wish them well - a closing flourish like 'Have a beautiful day ahead in Namma Bengaluru' is welcome - then say 'Pranaam and take care!' and call end_call. Never say Namaste at ending."
         ),
     )
     initial_ctx.add_message(
@@ -1816,6 +2099,13 @@ def build_initial_context() -> llm.ChatContext:
             f"# CURRENT DATE AND TIME CONTEXT\n"
             f"Use this context to resolve relative dates (like tomorrow, kal, parso, next week) correctly:\n"
             f"{today_line}"
+        ),
+    )
+    initial_ctx.add_message(
+        role="system",
+        content=(
+            "# PRELOADED CALLER CONTEXT\n"
+            f"{patient_context_prompt(preloaded_user)}"
         ),
     )
     return initial_ctx
@@ -1867,23 +2157,32 @@ def prewarm_process(proc: JobProcess) -> None:
             error=exc,
             traceback=traceback.format_exc(),
         )
-async def entrypoint(ctx: JobContext):
-    logger.info("Starting MyStree care coordinator agent session.")
-    pipeline_event("worker", "info", "Entrypoint", "Starting MyStree care coordinator agent session")
-    pipeline_event("worker", "info", "Env diagnostics", "Worker process environment visibility", env=env_diagnostics())
-    livekit_url = os.getenv("LIVEKIT_URL", "")
-    pipeline_event(
-        "webrtc",
-        "info",
-        "LiveKit URL host",
-        "LiveKit server host surfaced for region verification",
-        event="livekit_url_host",
-        host=urlparse(livekit_url).hostname,
-        url_present=bool(livekit_url),
-    )
-    usage_collector = metrics.UsageCollector()
-
+async def request_process(req: JobRequest) -> None:
+    logger.info("Received job request for room %s (job_id=%s)", req.room.name, req.id)
     try:
+        await req.accept()
+        logger.info("Job request accepted successfully for room %s (job_id=%s)", req.room.name, req.id)
+    except Exception as exc:
+        logger.error("Failed to accept job request for room %s (job_id=%s):\n%s", req.room.name, req.id, traceback.format_exc())
+        raise
+
+
+async def entrypoint(ctx: JobContext):
+    try:
+        logger.info("Starting MyStree care coordinator agent session.")
+        pipeline_event("worker", "info", "Entrypoint", "Starting MyStree care coordinator agent session")
+        pipeline_event("worker", "info", "Env diagnostics", "Worker process environment visibility", env=env_diagnostics())
+        livekit_url = os.getenv("LIVEKIT_URL", "")
+        pipeline_event(
+            "webrtc",
+            "info",
+            "LiveKit URL host",
+            "LiveKit server host surfaced for region verification",
+            event="livekit_url_host",
+            host=urlparse(livekit_url).hostname,
+            url_present=bool(livekit_url),
+        )
+        usage_collector = metrics.UsageCollector()
         # Connect to the room first so the WebRTC join overlaps provider construction.
         logger.info("Connecting to LiveKit room.")
         connect_started = time.perf_counter()
@@ -1898,32 +2197,103 @@ async def entrypoint(ctx: JobContext):
             room=getattr(ctx.room, "name", None),
         )
 
-        # The caller's UI can pick a Sarvam voice; it arrives as participant
-        # metadata in the access token ({"sarvam_speaker": "priya"}).
-        requested_voice = None
+        # The caller's UI can pick a TTS provider (Sarvam/Rumik/Smallest)
+        # and a voice within it. Prefer dispatch/job metadata because it
+        # exists before the browser participant metadata is synced;
+        # participant metadata is only a fallback. This prevents the worker
+        # from racing ahead and locking TTS to the default provider/voice.
+        job_metadata_payload = parse_metadata_json(getattr(ctx.job, "metadata", ""))
+        requested_tts_provider, requested_voice = provider_and_voice_from_metadata(job_metadata_payload)
+        participant = None
+        caller_phone = caller_phone_from_metadata_payload(job_metadata_payload)
+        voice_source = "dispatch" if requested_voice else "default"
+        if requested_voice:
+            pipeline_event(
+                "tts",
+                "ok",
+                "Voice selected from dispatch",
+                f"Using {requested_tts_provider} voice {requested_voice} from LiveKit dispatch metadata",
+                provider=requested_tts_provider,
+                speaker=requested_voice,
+                source="dispatch",
+            )
         try:
-            participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=10)
+            remote_participants = getattr(ctx.room, "remote_participants", None)
+            if isinstance(remote_participants, dict) and remote_participants:
+                participant = next(iter(remote_participants.values()))
+            else:
+                participant = await asyncio.wait_for(
+                    ctx.wait_for_participant(),
+                    timeout=float(os.getenv("CALLER_METADATA_WAIT_SECONDS", "3.0")),
+                )
             if participant.metadata:
-                requested_voice = json.loads(participant.metadata).get("sarvam_speaker")
+                metadata_payload = parse_metadata_json(participant.metadata)
+                participant_provider, participant_voice = provider_and_voice_from_metadata(metadata_payload)
+                if participant_voice:
+                    requested_tts_provider = participant_provider
+                    requested_voice = participant_voice
+                    voice_source = "participant"
+                caller_phone = caller_phone or caller_phone_from_metadata_payload(metadata_payload)
+            caller_phone = caller_phone or extract_caller_phone_from_metadata(participant)
             pipeline_event(
                 "dispatch", "info", "Caller joined",
-                f"participant={participant.identity} voice={requested_voice or 'default'}",
+                f"participant={participant.identity} provider={requested_tts_provider} voice={requested_voice or 'default'}",
+                voice_source=voice_source,
+                caller_phone_tail=(db_helper.normalize_phone(caller_phone)[-4:] if caller_phone else None),
             )
         except Exception:
-            pipeline_event("dispatch", "warn", "No caller metadata", "Proceeding with default voice")
+            pipeline_event(
+                "dispatch",
+                "info" if requested_voice else "warn",
+                "Caller metadata skipped",
+                (
+                    f"Participant metadata was not ready; continuing with dispatch voice {requested_voice}"
+                    if requested_voice
+                    else "Starting immediately with default voice; metadata was not ready"
+                ),
+                voice_source=voice_source,
+                provider=requested_tts_provider,
+                speaker=requested_voice or os.getenv("SARVAM_SPEAKER", "ishita"),
+            )
 
+        preload_task = asyncio.create_task(preload_user(caller_phone))
         pipeline_event("dispatch", "info", "Provider build", "Building STT, LLM, TTS, VAD, and turn detector")
+        
+        try:
+            stt_provider = build_stt()
+        except Exception:
+            logger.error("Failed to build STT provider:\n%s", traceback.format_exc())
+            raise
+
+        try:
+            vad_provider = ctx.proc.userdata.get("vad") or silero.VAD.load(min_silence_duration=float(os.getenv("VAD_MIN_SILENCE", "0.3")))
+        except Exception:
+            logger.error("Failed to load VAD provider:\n%s", traceback.format_exc())
+            raise
+
+        try:
+            llm_provider = build_llm()
+        except Exception:
+            logger.error("Failed to build LLM provider:\n%s", traceback.format_exc())
+            raise
+
+        try:
+            tts_provider = build_tts(tts_provider=requested_tts_provider, voice_id=requested_voice)
+        except Exception:
+            logger.error("Failed to build TTS provider:\n%s", traceback.format_exc())
+            raise
+
         session = AgentSession(
-            stt=build_stt(),
-            vad=ctx.proc.userdata.get("vad")
-            or silero.VAD.load(min_silence_duration=float(os.getenv("VAD_MIN_SILENCE", "0.3"))),
-            llm=build_llm(),
-            tts=build_tts(ctx.proc.userdata.get("kitten_tts"), sarvam_speaker_override=requested_voice),
+            stt=stt_provider,
+            vad=vad_provider,
+            llm=llm_provider,
+            tts=tts_provider,
             tools=[
                 lookup_appointments,
                 lookup_patient_history,
                 book_appointment,
                 cancel_appointment,
+                reschedule_appointment,
                 lookup_doctors,
                 lookup_booking_timings,
                 find_slots,
@@ -1941,6 +2311,19 @@ async def entrypoint(ctx: JobContext):
             ),
         )
 
+        # EOU commit is owned entirely by the semantic multilingual turn
+        # detector configured in build_turn_handling() - no custom watchdog
+        # timer forcing replies here. A stalled detector should surface as a
+        # visible bug, not be silently papered over by a force-reply hack.
+        turn_transcripts: list[dict] = []
+        state_watch = {
+            "agent": "initializing",
+            "user": "listening",
+            "last_user_activity": time.perf_counter(),
+            "last_transcript": time.perf_counter(),
+            "last_ping": 0.0,
+        }
+
         @session.on("metrics_collected")
         def _on_metrics_collected(ev: MetricsCollectedEvent):
             metrics.log_metrics(ev.metrics)
@@ -1957,6 +2340,38 @@ async def entrypoint(ctx: JobContext):
                         "transcription_delay_ms": round(getattr(ev.metrics, "transcription_delay", 0) * 1000, 2),
                     }
                 )
+            elif metric_type == "llm_metrics":
+                metric_details.update(
+                    {
+                        "event": "llm_ttft_ms",
+                        "ttft_ms": round(getattr(ev.metrics, "ttft", 0) * 1000, 2),
+                        "prompt_tokens": getattr(ev.metrics, "prompt_tokens", getattr(ev.metrics, "input_tokens", 0)),
+                        "total_tokens": getattr(ev.metrics, "total_tokens", 0),
+                    }
+                )
+                pipeline_event(
+                    "llm",
+                    "ok",
+                    "Turn TTFT",
+                    "LLM first token timing collected",
+                    **{k: v for k, v in metric_details.items() if k != "metrics"},
+                )
+            elif metric_type == "tts_metrics":
+                metric_details.update(
+                    {
+                        "event": "ttfa_ms",
+                        "ttfa_ms": round(getattr(ev.metrics, "ttfb", 0) * 1000, 2),
+                        "audio_duration_ms": round(getattr(ev.metrics, "audio_duration", 0) * 1000, 2),
+                        "characters_count": getattr(ev.metrics, "characters_count", 0),
+                    }
+                )
+                pipeline_event(
+                    "tts",
+                    "ok",
+                    "Turn TTFA",
+                    "Time to first audio collected",
+                    **{k: v for k, v in metric_details.items() if k != "metrics"},
+                )
             pipeline_event(
                 stage_key,
                 status,
@@ -1969,6 +2384,8 @@ async def entrypoint(ctx: JobContext):
         def _on_user_input_transcribed(ev):
             transcript = getattr(ev, "transcript", "")
             is_final = getattr(ev, "is_final", False)
+            state_watch["last_transcript"] = time.perf_counter()
+            state_watch["last_user_activity"] = time.perf_counter()
             pipeline_event(
                 "stt",
                 "ok" if is_final else "info",
@@ -1979,10 +2396,19 @@ async def entrypoint(ctx: JobContext):
                 language=getattr(ev, "language", None),
             )
             booking_prefetch.handle_transcript(transcript, is_final)
-
+            turn_transcripts.append(
+                {
+                    "role": "user",
+                    "text": transcript,
+                    "final": bool(is_final),
+                    "language": getattr(ev, "language", None),
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+            )
         @session.on("agent_state_changed")
         def _on_agent_state_changed(ev):
             new_state = getattr(ev, "new_state", "")
+            state_watch["agent"] = str(new_state)
             status = "ok" if str(new_state) in {"speaking", "listening", "thinking"} else "info"
             pipeline_event(
                 "dispatch",
@@ -1993,11 +2419,14 @@ async def entrypoint(ctx: JobContext):
 
         @session.on("user_state_changed")
         def _on_user_state_changed(ev):
+            new_state = str(getattr(ev, "new_state", ""))
+            state_watch["user"] = new_state
+            state_watch["last_user_activity"] = time.perf_counter()
             pipeline_event(
                 "microphone",
                 "info",
                 "User audio state",
-                f"{getattr(ev, 'old_state', '')} -> {getattr(ev, 'new_state', '')}",
+                f"{getattr(ev, 'old_state', '')} -> {new_state}",
             )
 
         @session.on("speech_created")
@@ -2059,12 +2488,20 @@ async def entrypoint(ctx: JobContext):
 
         agent = Agent(
             instructions="You are a human receptionist for MyStree Clinic. Never call yourself an AI.",
-            chat_ctx=build_initial_context(),
+            chat_ctx=build_initial_context(await preload_task),
         )
 
         logger.info("Starting AgentSession with cascaded fallback providers.")
         session_started = time.perf_counter()
         pipeline_event("dispatch", "info", "Session start", "Starting AgentSession with fallback providers")
+        pipeline_event(
+            "microphone",
+            "info",
+            "Noise cancellation enabled",
+            "LiveKit BVC noise suppression applied before STT and turn detection",
+            event="noise_cancellation_enabled",
+            provider="LiveKit BVC",
+        )
         await session.start(
             agent,
             room=ctx.room,
@@ -2079,11 +2516,35 @@ async def entrypoint(ctx: JobContext):
         )
 
         greeting_started = time.perf_counter()
-        active_voice = (requested_voice or os.getenv("SARVAM_SPEAKER", "ishita")).strip().lower()
-        cached_frames = load_cached_greeting(active_voice)
+        # The greeting is deliberately slower-paced than the rest of the call
+        # (see _build_greeting_tts) - a caller's first impression matters more
+        # than the few tenths of a second it costs. Every turn after the
+        # greeting uses the faster session tts_provider to keep per-minute
+        # call cost down. Pre-rendered greeting WAV cache only exists for
+        # Sarvam (assets/audio/greetings/ is keyed by Sarvam speaker name).
+        is_sarvam_call = requested_tts_provider == "sarvam"
+        default_voice_for_provider = os.getenv("SARVAM_SPEAKER", "ishita") if is_sarvam_call else (voice_catalog_default(requested_tts_provider) or "")
+        active_voice = (requested_voice or default_voice_for_provider).strip().lower()
+        cached_frames = load_cached_greeting(active_voice) if is_sarvam_call else None
+
+        if not cached_frames:
+            # No cache hit - synthesize the greeting once with a slow-paced
+            # instance (skipped for providers with no speed knob, e.g. Rumik;
+            # that greeting just uses the normal-speed session tts below).
+            try:
+                greeting_tts = _build_greeting_tts(requested_tts_provider, active_voice)
+                if greeting_tts is not None:
+                    greeting_stream = greeting_tts.synthesize(GREETING_TEXT)
+                    cached_frames = [event.frame async for event in greeting_stream]
+                    await greeting_stream.aclose()
+                    await greeting_tts.aclose()
+            except Exception:
+                logger.warning("Slow-paced greeting synthesis failed; falling back to normal-speed greeting", exc_info=True)
+                cached_frames = None
+
         pipeline_event(
             "tts", "info", "Greeting queued", GREETING_TEXT,
-            event="greeting_queued", voice=active_voice, cached=bool(cached_frames),
+            event="greeting_queued", provider=requested_tts_provider, voice=active_voice, cached=bool(cached_frames),
         )
         if cached_frames:
             async def _greeting_aiter():
@@ -2093,13 +2554,16 @@ async def entrypoint(ctx: JobContext):
             await session.say(GREETING_TEXT, audio=_greeting_aiter(), allow_interruptions=True)
         else:
             await session.say(GREETING_TEXT, allow_interruptions=True)
-            # Render and store this voice's greeting in the background so the
-            # next call with it starts speaking instantly.
+
+        if is_sarvam_call and not load_cached_greeting(active_voice):
+            # Render and store this voice's greeting in the background, at the
+            # same slow greeting pace, so the next call with it starts
+            # speaking instantly.
             try:
                 cache_tts = SarvamTTS(
                     api_key=required_env("SARVAM_API_KEY"),
                     speaker=active_voice,
-                    pace=float(os.getenv("SARVAM_PACE", "1.0")),
+                    pace=float(os.getenv("SARVAM_PACE_GREETING", "0.9")),
                 )
                 asyncio.create_task(ensure_greeting_cache(active_voice, cache_tts))
             except Exception:
@@ -2117,29 +2581,100 @@ async def entrypoint(ctx: JobContext):
         from livekit import rtc
 
         while ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
+            now = time.perf_counter()
+            silence_s = now - max(state_watch["last_user_activity"], state_watch["last_transcript"])
+            ping_gap_s = now - state_watch["last_ping"]
+            if (
+                env_flag("ENABLE_LINE_LIVE_CHECK", True)
+                and state_watch["agent"] == "listening"
+                and state_watch["user"] != "speaking"
+                and silence_s > float(os.getenv("LINE_LIVE_CHECK_SECONDS", "7.0"))
+                and ping_gap_s > float(os.getenv("LINE_LIVE_CHECK_COOLDOWN_SECONDS", "25.0"))
+            ):
+                state_watch["last_ping"] = now
+                phrase = os.getenv(
+                    "LINE_LIVE_CHECK_TEXT",
+                    "Take your time... I am right here whenever you're ready.",
+                )
+                pipeline_event(
+                    "turn",
+                    "warn",
+                    "Line live check",
+                    "Agent listening with sustained silence; sending short check-in",
+                    event="line_live_check",
+                    silence_s=round(silence_s, 2),
+                    phrase=phrase,
+                )
+                try:
+                    await session.say(phrase, allow_interruptions=True)
+                except Exception:
+                    pipeline_event(
+                        "turn",
+                        "warn",
+                        "Line live check failed",
+                        "Unable to speak line-is-live prompt",
+                        traceback=traceback.format_exc(),
+                    )
 
         slot_cache.stop()
         logger.info("Room disconnected, ending agent task.")
         pipeline_event("webrtc", "warn", "Room disconnected", "LiveKit room disconnected")
         logger.info("Session usage summary: %s", usage_collector.get_summary())
         pipeline_event("worker", "ok", "Usage summary", "Session ended", usage=usage_collector.get_summary())
+        post_call_report = summarize_call_from_transcripts(
+            turn_transcripts,
+            await preload_task,
+            getattr(ctx.room, "name", None),
+        )
+        await save_post_call_report(post_call_report)
     except Exception:
         pipeline_event("worker", "error", "Fatal entrypoint error", "Agent entrypoint crashed", traceback=traceback.format_exc())
         logger.error("Fatal error in agent entrypoint:\n%s", traceback.format_exc())
         raise
 
 
-if __name__ == "__main__":
+def _acquire_singleton_lock():
+    """Refuse to start if another worker is already running on this machine.
+
+    Duplicate workers repeatedly caused silent calls: LiveKit round-robins jobs
+    across registered workers, so a second (often stale/broken) copy stole
+    ~half the calls. Binding a localhost port is an OS-enforced mutex that
+    releases automatically if the process dies.
+    """
+    import socket
+    import sys
+
+    port = int(os.getenv("WORKER_SINGLETON_PORT", "47821"))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # NOTE: deliberately no SO_REUSEADDR — on Windows it would allow a second bind.
     try:
-        if env_flag("LIVEKIT_AUTO_DISPATCH", True):
-            os.environ.pop("LIVEKIT_AGENT_NAME", None)
-            os.environ.pop("LIVEKIT_AGENT_NAME_OVERRIDE", None)
+        sock.bind(("127.0.0.1", port))
+        sock.listen(1)
+        return sock  # held open for the process lifetime
+    except OSError:
+        msg = (
+            f"ANOTHER agent worker is already running (singleton port {port} is taken). "
+            "Refusing to start a duplicate - duplicates steal LiveKit jobs and cause silent calls. "
+            "Stop the other worker first, or set WORKER_SINGLETON_PORT to run a second deliberately."
+        )
+        print(msg)
+        pipeline_event("worker", "error", "Duplicate worker blocked", msg)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    _singleton_lock = _acquire_singleton_lock()
+    try:
+        agent_name = os.getenv("LIVEKIT_AGENT_NAME", "mystree-care")
         pipeline_event("worker", "info", "Worker boot", "Starting LiveKit worker process")
         cli.run_app(
             WorkerOptions(
                 entrypoint_fnc=entrypoint,
                 prewarm_fnc=prewarm_process,
+                request_fnc=request_process,
+                agent_name=agent_name,
+                num_idle_processes=int(os.getenv("LIVEKIT_NUM_IDLE_PROCESSES", "1")),
                 # KittenTTS prewarm can take >10s on this machine; the framework
                 # default (10s) was killing the job process before it could join
                 # the room, which made Start Call silently do nothing.
@@ -2148,5 +2683,3 @@ if __name__ == "__main__":
         )
     except (KeyboardInterrupt, SystemExit):
         logger.info("Received termination signal. Closing care coordinator agent.")
-
-
