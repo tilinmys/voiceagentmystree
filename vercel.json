@@ -1,0 +1,11 @@
+{
+  "rewrites": [
+    { "source": "/", "destination": "/frontend/local_preview.html" },
+    { "source": "/api/token", "destination": "/api/livekit-token" }
+  ],
+  "functions": {
+    "api/*.py": {
+      "includeFiles": "{voice_catalog,vercel_common}.py"
+    }
+  }
+}

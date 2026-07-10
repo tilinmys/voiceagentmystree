@@ -43,6 +43,20 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("agent")
 PIPELINE_LOG_PATH = Path(os.getenv("PIPELINE_LOG_PATH", "logs/pipeline_events.jsonl"))
 
+# Also write our own log file, not just stdout. Locally this used to be done
+# by shell redirection (`python agent.py dev >> logs/worker_background.log`);
+# on a host like Railway there's no such redirection, and status_server.py's
+# health check reads this exact file (same regex-based logic local_server.py
+# used when it ran on the same machine as the worker - see DEPLOY.md).
+try:
+    _worker_log_path = Path("logs/worker_background.log")
+    _worker_log_path.parent.mkdir(parents=True, exist_ok=True)
+    _file_handler = logging.FileHandler(_worker_log_path, encoding="utf-8")
+    _file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s %(name)s - %(message)s"))
+    logging.getLogger().addHandler(_file_handler)
+except OSError:
+    logger.warning("Could not open logs/worker_background.log for writing; status server health check will report 'not found'.")
+
 STAGES = {
     "worker": "Stage 0 Worker",
     "auth": "Stage 1 Auth",
@@ -2667,6 +2681,10 @@ if __name__ == "__main__":
     _singleton_lock = _acquire_singleton_lock()
     try:
         agent_name = os.getenv("LIVEKIT_AGENT_NAME", "mystree-care")
+        if env_flag("ENABLE_STATUS_SERVER", True):
+            from status_server import start_status_server
+
+            start_status_server()
         pipeline_event("worker", "info", "Worker boot", "Starting LiveKit worker process")
         cli.run_app(
             WorkerOptions(
