@@ -1,0 +1,31 @@
+# Vercel hosts only the static frontend + api/index.py (see DEPLOY.md).
+# The LiveKit agent worker runs on Railway - none of its heavy dependencies
+# or source belong in the Vercel build. Excluding the root requirements.txt
+# is the critical line here: without it, Vercel's Python builder picked up
+# agent.py's full dependency set (livekit-agents + every STT/TTS/LLM plugin,
+# including kittentts's bundled model weights) and produced a 5.3GB bundle
+# against Vercel's 500MB function size limit. api/requirements.txt (just
+# livekit-api) is the only one Vercel should ever see.
+/requirements.txt
+
+# Worker source - never imported by api/index.py, no reason to ship it.
+/agent.py
+/db_helper.py
+/sarvam_wrappers.py
+/smallest_wrappers.py
+/rumik_wrappers.py
+/status_server.py
+
+# Not needed at runtime.
+/assets/
+/tests/
+/scripts/
+/data/
+/logs/
+/CHANGELOG.md
+/LATENCY_NOTES.md
+/fixed.md
+/DEPLOY.md
+/Procfile
+/railway.json
+*.wav

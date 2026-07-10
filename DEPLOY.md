@@ -88,13 +88,15 @@ dispatch in `do_GET`, and `vercel.json` rewrites every public path to it:
 longer applies now that everything lives in `index.py`, but is worth
 remembering if you ever split functions back out.)
 
-`api/requirements.txt` (just `livekit-api`) is scoped to the `api/`
-directory so Vercel doesn't try to install `agent.py`'s full dependency set
-(`livekit-agents` + every STT/TTS/LLM plugin) for these tiny functions. If a
-Vercel build ever picks up the *root* `requirements.txt` instead (platform
-behavior here has shifted before), that's a sign the requirements
-resolution changed — check Vercel's current docs for per-function
-requirements.txt precedence.
+**`.vercelignore` excludes the root `requirements.txt`.** This is not
+optional: on first deploy, Vercel's Python builder read the root
+`requirements.txt` (agent.py's full dependency set - `livekit-agents` +
+every STT/TTS/LLM plugin, including `kittentts`'s bundled model weights) and
+produced a **5.3 GB** bundle against Vercel's 500 MB function size limit.
+Hiding the root file via `.vercelignore` (along with `agent.py`,
+`db_helper.py`, and the other worker-only source files - none of it is
+imported by `api/index.py` anyway) leaves `api/requirements.txt` (just
+`livekit-api`) as the only one Vercel can find.
 
 ## What's simplified in the split-host version
 
