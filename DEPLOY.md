@@ -63,16 +63,30 @@ Import the same repo. Vercel env vars — **only these, nothing else**:
 | `RAILWAY_WORKER_URL` | the public Railway URL from above, no trailing slash |
 | `LIVEKIT_EXPLICIT_DISPATCH` | `true` (matches local default) |
 
-`vercel.json` handles routing:
+**All four API routes are served by one file, `api/index.py`.** Vercel's
+current Python runtime (CLI 55.0.0, confirmed live 2026-07) wants a single
+entrypoint at a recognized default location (`app.py`/`index.py`/`server.py`/
+`main.py`/`wsgi.py`/`asgi.py`, at root or under `src/`, `app/`, or `api/`).
+The older "drop one `.py` file per endpoint in `/api`, each auto-detected"
+pattern - which is what this project originally used (`api/livekit-token.py`,
+`api/logs.py`, `api/worker-status.py`, `api/tts-catalog.py`) - built locally
+but failed on Vercel with `No python entrypoint found in default locations`,
+even though every file defined a top-level `handler`. Consolidated into
+`api/index.py` (a recognized default location) with internal path-based
+dispatch in `do_GET`, and `vercel.json` rewrites every public path to it:
+
 - `/` → `frontend/local_preview.html` (static, no duplication)
-- `/api/token` → `/api/livekit-token` (the file is named `livekit-token.py`,
-  not `token.py` — a file literally named `token.py` shadows Python's own
-  stdlib `token` module once Vercel puts the function's directory on
-  `sys.path`, and breaks `tokenize`/`traceback`/`logging` on cold start.
-  Confirmed locally before renaming; the rewrite keeps the frontend's existing
-  `fetch("/api/token")` calls working unchanged.)
-- `api/*.py` functions get `voice_catalog.py` and `vercel_common.py` bundled
-  in via `functions.includeFiles` (they live at repo root, not under `api/`).
+- `/api/token`, `/api/logs`, `/api/worker-status`, `/api/tts-catalog` →
+  `/api/index` (Vercel rewrites preserve the original request path, so
+  `do_GET` still sees the real path to route on - confirmed locally)
+- `api/index.py` gets `voice_catalog.py` and `vercel_common.py` bundled in
+  via `functions.includeFiles` (they live at repo root, not under `api/`)
+
+(The earlier `token.py`/stdlib-collision issue - a file literally named
+`token.py` shadows Python's own `tokenize`/`traceback`/`logging`-internal
+`token` module once Vercel puts the function directory on `sys.path` - no
+longer applies now that everything lives in `index.py`, but is worth
+remembering if you ever split functions back out.)
 
 `api/requirements.txt` (just `livekit-api`) is scoped to the `api/`
 directory so Vercel doesn't try to install `agent.py`'s full dependency set

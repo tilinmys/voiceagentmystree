@@ -1,19 +1,21 @@
-"""Vercel serverless function: GET /api/livekit-token (rewritten from
-/api/token by vercel.json - the frontend keeps calling /api/token unchanged).
+"""Single Vercel Python entrypoint, routing all API paths internally.
 
-Named livekit-token.py, not token.py: Vercel's Python runtime puts this
-file's directory on sys.path, and a file literally named token.py shadows
-the stdlib `token` module that `tokenize`/`traceback`/`logging` import
-internally - breaks on function cold start with a cryptic ImportError.
-Confirmed locally before renaming.
+Vercel's current Python runtime (CLI 55.0.0, confirmed live 2026-07) wants
+one entrypoint at a "default location" (app.py/index.py/server.py/main.py/
+wsgi.py/asgi.py, at root or inside src/, app/, or api/) defining a top-level
+`app`/`application`/`handler`. The older "one file per endpoint under /api,
+each auto-detected" pattern documented elsewhere did not reliably trigger
+here - the build failed with "No python entrypoint found in default
+locations" even though api/livekit-token.py etc. all defined `handler`.
 
-Issues a LiveKit access token and creates an explicit agent dispatch, same
-logic as frontend/local_server.py's handle_token - ported to Vercel's
-BaseHTTPRequestHandler function convention. Needs only LIVEKIT_URL,
-LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_AGENT_NAME, and
-RAILWAY_WORKER_URL as Vercel env vars - never the TTS/STT/LLM provider keys,
-since this function never runs agent.py.
+Fix: consolidate every endpoint into this one file (api/index.py - a
+recognized default location), with vercel.json rewriting each public path
+(/api/token, /api/logs, /api/worker-status, /api/tts-catalog) to /api/index.
+Vercel rewrites preserve the original request path, so do_GET still sees the
+real path to dispatch on.
 """
+
+from __future__ import annotations
 
 import asyncio
 import base64
@@ -29,10 +31,12 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import voice_catalog  # noqa: E402
-from vercel_common import fetch_worker_status  # noqa: E402
+from vercel_common import fetch_logs, fetch_worker_status  # noqa: E402
 
 DEFAULT_AGENT_NAME = "mystree-care"
 
+
+# --- token issuance + dispatch -------------------------------------------
 
 def b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
@@ -98,6 +102,20 @@ def create_agent_dispatch(room: str, metadata: str | None = None) -> str | None:
 class handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path.endswith("/token"):
+            self._handle_token(parsed)
+        elif path.endswith("/logs"):
+            self._handle_logs(parsed)
+        elif path.endswith("/worker-status"):
+            self._send_json(fetch_worker_status())
+        elif path.endswith("/tts-catalog"):
+            self._send_json(voice_catalog.as_json_catalog())
+        else:
+            self.send_error(404)
+
+    def _handle_token(self, parsed) -> None:
         params = parse_qs(parsed.query)
 
         # Unique room per call: reusing a fixed room name lets a second call join a
@@ -158,6 +176,18 @@ class handler(BaseHTTPRequestHandler):
             )
         except Exception as exc:
             self._send_json({"error": f"Server misconfigured: {exc}"}, status=500)
+
+    def _handle_logs(self, parsed) -> None:
+        params = parse_qs(parsed.query)
+        raw_since = params.get("since", ["0"])[0]
+        if raw_since == "latest":
+            self._send_json({"next": 0, "events": []})
+            return
+        try:
+            since = max(0, int(raw_since))
+        except ValueError:
+            since = 0
+        self._send_json(fetch_logs(since))
 
     def _send_json(self, payload, status: int = 200) -> None:
         data = json.dumps(payload).encode("utf-8")
