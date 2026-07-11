@@ -2046,7 +2046,7 @@ def _build_greeting_tts(provider: str, voice_id: str | None) -> tts.TTS | None:
 
 def build_turn_handling() -> TurnHandlingOptions:
     turn_detection = "stt"
-    if multilingual_model is not None and env_flag("ENABLE_MULTILINGUAL_TURN_DETECTOR", True):
+    if multilingual_model is not None and env_flag("ENABLE_MULTILINGUAL_TURN_DETECTOR", False):
         turn_detection = multilingual_model()
     elif MultilingualModel is None:
         logger.warning("livekit-agents-turn-detector is not installed; falling back to STT turn detection.")
