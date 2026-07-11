@@ -125,6 +125,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/":
+            self._send_json({"status": "MyStree Voice Agent Worker is running"})
+            return
         if parsed.path in {"/health", "/api/worker-status"}:
             self._send_json(worker_status())
             return
