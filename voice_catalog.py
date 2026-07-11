@@ -109,12 +109,22 @@ SMALLEST_VOICES = {
 SMALLEST_DEFAULT_MODEL = "lightning-v3.1"
 SMALLEST_SAMPLE_RATE = 24000
 
-PROVIDERS = ("sarvam", "rumik", "smallest")
+GEMINI_VOICES = {
+    "Kore": {"name": "Kore", "gender": "female", "style": "firm, professional"},
+    "Aoede": {"name": "Aoede", "gender": "female", "style": "breezy, warm"},
+    "Puck": {"name": "Puck", "gender": "male", "style": "upbeat, friendly"},
+    "Zephyr": {"name": "Zephyr", "gender": "female", "style": "bright, conversational"},
+    "Charon": {"name": "Charon", "gender": "male", "style": "informative, measured"},
+    "Leda": {"name": "Leda", "gender": "female", "style": "youthful, clear"},
+}
+
+PROVIDERS = ("sarvam", "rumik", "smallest", "gemini")
 
 CATALOG = {
     "sarvam": SARVAM_VOICES,
     "rumik": RUMIK_VOICES,
     "smallest": SMALLEST_VOICES,
+    "gemini": GEMINI_VOICES,
 }
 
 # Gated so local_server.py can refuse to hand out a token for an unavailable
@@ -124,12 +134,13 @@ PROVIDER_AVAILABLE = {
     "sarvam": True,
     "rumik": True,
     "smallest": True,
+    "gemini": True,
 }
 PROVIDER_UNAVAILABLE_REASON: dict[str, str] = {}
 
 
 def default_voice(provider: str) -> str | None:
-    defaults = {"sarvam": "ishita", "rumik": "priya_warm", "smallest": "maithili"}
+    defaults = {"sarvam": "ishita", "rumik": "priya_warm", "smallest": "maithili", "gemini": "Kore"}
     return defaults.get(provider)
 
 

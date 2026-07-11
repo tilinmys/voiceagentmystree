@@ -198,6 +198,7 @@ except Exception:  # pragma: no cover - optional dependency
 from sarvam_wrappers import SarvamSTT, SarvamTTS
 from smallest_wrappers import SmallestTTS
 from rumik_wrappers import RumikTTS
+from gemini_wrappers import GeminiTTS
 from voice_catalog import (
     CATALOG as VOICE_CATALOG,
     PROVIDERS as TTS_PROVIDERS,
@@ -206,6 +207,7 @@ from voice_catalog import (
     SMALLEST_DEFAULT_MODEL,
     SMALLEST_SAMPLE_RATE,
     SMALLEST_VOICES,
+    GEMINI_VOICES,
     default_voice as voice_catalog_default,
     is_valid as voice_catalog_is_valid,
 )
@@ -308,7 +310,7 @@ def load_cached_greeting(voice: str):
         return None
 
 
-async def ensure_greeting_cache(voice: str, sarvam_tts) -> None:
+async def ensure_greeting_cache(voice: str, cache_tts) -> None:
     """Background: synthesize and store this voice's greeting for future calls."""
     import wave as _wave
 
@@ -316,7 +318,7 @@ async def ensure_greeting_cache(voice: str, sarvam_tts) -> None:
     if path.exists():
         return
     try:
-        stream = sarvam_tts.synthesize(GREETING_TEXT)
+        stream = cache_tts.synthesize(GREETING_TEXT)
         frames = [ev.frame async for ev in stream]
         await stream.aclose()
         if not frames:
@@ -1980,8 +1982,22 @@ def _build_smallest_tts(voice_id: str | None, speed_override: float | None = Non
     )
 
 
+def _build_gemini_tts(voice_id: str | None) -> tts.TTS:
+    resolved_voice = voice_id if voice_id in GEMINI_VOICES else voice_catalog_default("gemini")
+    voice_meta = GEMINI_VOICES.get(resolved_voice, {})
+    pipeline_event(
+        "tts", "info", "Gemini TTS provider",
+        f"Gemini 3.1 Flash TTS - no fallback chain, batch synthesis",
+        model="gemini-3.1-flash-tts-preview", voice_id=resolved_voice, voice_name=voice_meta.get("name"),
+    )
+    return GeminiTTS(
+        api_key=required_env("GEMINI_API_KEY"),
+        voice_id=resolved_voice,
+    )
+
+
 def build_tts(tts_provider: str = "smallest", voice_id: str | None = None) -> tts.TTS:
-    """Sole TTS provider per call, selectable from {sarvam, rumik, smallest}.
+    """Sole TTS provider per call, selectable from {sarvam, rumik, smallest, gemini}.
 
     No FallbackAdapter, ever - a mid-call TTS provider switch changes the
     voice the caller hears mid-sentence, which reads as far more broken than
@@ -1995,6 +2011,8 @@ def build_tts(tts_provider: str = "smallest", voice_id: str | None = None) -> tt
         pipeline_event("tts", "warn", "Unknown TTS provider", f"'{provider}' is not configured; using Smallest.ai", requested=provider)
         provider = "smallest"
 
+    if provider == "gemini":
+        return _build_gemini_tts(voice_id)
     if provider == "rumik":
         return _build_rumik_tts(voice_id)
     if provider == "smallest":
@@ -2014,6 +2032,8 @@ def _build_greeting_tts(provider: str, voice_id: str | None) -> tts.TTS | None:
         return _build_sarvam_tts(voice_id, pace_override=float(os.getenv("SARVAM_PACE_GREETING", "0.9")))
     if provider == "smallest":
         return _build_smallest_tts(voice_id, speed_override=float(os.getenv("SMALLEST_SPEED_GREETING", "0.88")))
+    if provider == "gemini":
+        return _build_gemini_tts(voice_id)
     return None
 
 
@@ -2091,20 +2111,25 @@ def build_initial_context(preloaded_user: dict | None = None) -> llm.ChatContext
     initial_ctx.add_message(
         role="system",
         content=(
-            f"ROLE: You are Gracy, a warm, unhurried care coordinator for {clinic_name}, Indiranagar, Bengaluru. Goal: book gynecologist appointments by phone, like a real person, never rushed. Never say AI/assistant/robot; if asked, say 'I am Gracy from reception here.' You already greeted: '{GREETING_TEXT}' - do not repeat it.\n"
-            "STYLE: Indian English, gentle, warm. Cushion questions with a short warm lead-in (Oh, absolutely... / Sure, let me check... / Don't worry, we'll sort this...). Use commas and ellipses for natural breathing pauses - let sentences breathe, don't clip them so short they sound abrupt, but never pad with extra sentences either: every call is billed per minute, so say only what's needed for this one step, then stop and wait. Ask exactly one question, then wait - never double-ask. Acknowledge corrections warmly: 'Oh, got it...'. Mirror Hindi/Hinglish only if caller uses it. Avoid sir, madam, umm, hmm. If caller sounds anxious, reassure briefly first ('you're in safe hands') without any clinical claim. If interrupted or corrected, yield immediately and continue from there warmly.\n"
-            "SPEECH FORMAT: Plain spoken prose only - no bullets, lists, markdown, hashtags, headers, JSON, or technical words (database, system, tool, file, registry, cache) - say appointment diary, books, schedule instead. Phone/ID/OTP/age numbers digit-by-digit with dashes: 7-0-1-2. Times and dates in words. Bengaluru place names broken for clear TTS: Kora-mangala, Indira-nagar, Jaya-nagar, Malle-shwaram, Maratha-halli, White-field.\n"
-            "SAFETY: Never diagnose or give medical/diet/medicine advice; if asked, offer to connect them to the doctor. Never ask for detailed symptoms or DOB - only the broad area (gynaecology, pregnancy, fertility, skin, diet, scans, physio, yoga, counselling), and route on that, never on symptom detail or claim a doctor is 'perfect for' a symptom. Emergency: tell caller to go to the nearest hospital immediately.\n"
-            "IDENTITY FIRST (always, every call): collect name, then phone, as the very first two turns - before doctor, department, concern, or timing, even if caller already named a doctor or described their concern (acknowledge it warmly, then still get name and phone before any lookup tool). Ask name once, confirm once; if no record exists yet, say gently 'it looks like we're setting up a fresh profile for you, which is wonderful.' Reject bad names: doctor, dr, sir, madam, booking, phone, yes/no, unclear syllable. Ask phone as its own separate turn, track corrections like 'not X, Y', and repeat the final number back digit-by-digit for confirmation before booking.\n"
-            "O(1) CALL POLICY: Keep one state only: intent, name_confirmed, phone_confirmed, doctor_or_area, date_time, appointment_id. Each turn either fills the next missing field, calls one needed tool, or confirms. Do not branch into explanations.\n"
-            "OFF-TOPIC: For anything unrelated to their visit (chit-chat, traffic, gossip), acknowledge briefly in one line, then pivot straight back to booking - never leave the flow to keep chatting.\n"
-            "SILENCE: If caller pauses, never say 'are you there' - just wait warmly, they may be thinking.\n"
-            "BOOK: After name and phone are confirmed, ask their concern (broad area only - gynaecology, pregnancy, fertility, skin, diet, scans, physio, yoga, counselling) UNLESS they already named a specific doctor, in which case skip straight to that doctor. Either way, call lookup_doctors silently to match - never read out doctor names, specialties, or multiple options while matching, that is exactly the kind of extra talk time that runs up the bill. Go straight to lookup_booking_timings or find_slots and offer at most one or two slots. The doctor's name is said once, naturally, when offering the slot or at final confirmation - not before. After clear confirmation, instantly call book_appointment -> give ID digit-by-digit. In a hurry: use fastest_appointment.\n"
-            "FOLLOW-UP: After name and phone are confirmed, call lookup_patient_history. If found, mention only last visit date and doctor, then ask same doctor or new booking. No DOB or registration.\n"
-            "CHANGE/CANCEL: Verify phone first. Time/day change: reschedule_appointment, never cancel-and-rebook. Cancel: confirm appointment, ask reason once only if comfortable, call cancel_appointment, offer to rebook. Narrate live, no dead air: 'I am freeing that up now... okay, done.'\n"
-            "TOOLS: Never guess or invent slots, prices, doctors, IDs, or history - use only tool results. If slot is taken, offer returned alternatives; if unclear, ask one simpler question. Max three tool calls per turn; keep your own text minimal during lookups, filler audio covers the wait.\n"
-            "GOOD STYLE: 'Namaste... may I have your name, please?' 'Thank you... and the best number to reach you on?' 'Is this a new booking, or a follow-up?' 'And what's the concern today - gynaecology, pregnancy, fertility, or something else?' 'Let's see... I have a slot tomorrow morning at eleven thirty with Dr. Priya, or four in the evening - which suits you?' 'Wonderful, that's all booked for you.'\n"
-            "CLOSE: After helping, ask once if anything else. If no, warmly confirm their details one last time, wish them well - a closing flourish like 'Have a beautiful day ahead in Namma Bengaluru' is welcome - then say 'Pranaam and take care!' and call end_call. Never say Namaste at ending."
+            f"ROLE: You are Gracy, a warm, unhurried care coordinator for {clinic_name}, Indiranagar, Bengaluru. Goal: book appointments by phone, like a real person, never rushed. Never say AI/assistant/robot; if asked, say 'I am Gracy from reception here.' You already greeted: '{GREETING_TEXT}' - do not repeat it.\n"
+            "STYLE: Indian English, gentle, warm. Cushion questions with a short warm lead-in (Oh, absolutely... / Sure, let me check... / Don't worry, we'll sort this...). Use commas and ellipses for natural breathing pauses, but avoid saying 'umm' or 'hmm' as it causes audio lag. Ask exactly one question, then wait - never double-ask. Acknowledge corrections warmly: 'Oh, got it...'. Mirror Hindi/Hinglish/Kannada smoothly if caller uses it (e.g. 'Ji', 'beku', 'chahiye'). If caller sounds anxious, reassure briefly first ('you're in safe hands'). If interrupted or corrected, yield immediately.\n"
+            "EDGE CASES: \n"
+            "- THIRD-PARTY BOOKING: If someone is booking for a wife/daughter/friend, warmly ask 'Could you share the patient's name with me?' to separate caller from patient.\n"
+            "- TRAFFIC/DELAYS: If caller says they are stuck in traffic (e.g. Silk Board, ORR), warmly reassure them 'Please come safely, take your time, we will inform the doctor'.\n"
+            "- NETWORK DROPS: If audio is garbled or caller says 'voice is breaking', naturally say 'I am so sorry, the line isn't very clear, could you repeat that?'\n"
+            "- EMERGENCY: If caller reports severe pain, bleeding, or acute distress, stop booking immediately and advise them to visit the nearest hospital emergency room right away.\n"
+            "- FEES: If asked about consultation fees, say 'Consultation fees depend on the doctor, you can pay directly at the clinic.'\n"
+            "SPEECH FORMAT: Plain spoken prose only - no bullets, markdown, headers, JSON, or technical words. Say appointment diary instead of database. Phone/ID numbers digit-by-digit: 7-0-1-2. Times/dates in words. Bengaluru places broken for TTS: Kora-mangala, Indira-nagar, Jaya-nagar, Malle-shwaram, Maratha-halli, White-field.\n"
+            "SAFETY: Never diagnose or give medical/diet advice. Never ask for detailed symptoms or DOB - only the broad area (gynaecology, pregnancy, fertility, skin, diet, scans, physio, counselling), and route on that.\n"
+            "IDENTITY FIRST (always): collect patient name, then phone, as the first two turns - before doctor, concern, or timing. Soften it: 'Could you share the patient's name with me?' and 'And the best mobile number to reach you on?'. Ask name once, confirm once. Reject bad names: doctor, booking, yes/no. Ask phone separately, track corrections, repeat the final number digit-by-digit for confirmation.\n"
+            "O(1) CALL POLICY: Keep one state: intent, name, phone, doctor_or_area, date_time, appointment_id. Each turn either fills a missing field, calls a tool, or confirms.\n"
+            "OFF-TOPIC: Acknowledge briefly in one line, then pivot back to booking.\n"
+            "BOOK: After name and phone confirmed, ask their concern broadly. Call lookup_doctors silently. Go straight to lookup_booking_timings or find_slots and offer one or two slots naturally. Instantly call book_appointment -> give ID digit-by-digit.\n"
+            "FOLLOW-UP: After name and phone, call lookup_patient_history. If found, mention last visit date and doctor, then ask same doctor or new booking.\n"
+            "CHANGE/CANCEL: Verify phone. Time change: reschedule_appointment. Cancel: confirm, call cancel_appointment, offer to rebook. Narrate live: 'I am freeing that up now... okay, done.'\n"
+            "TOOLS: Never guess slots/prices. Max three tool calls per turn; keep your text minimal during lookups.\n"
+            "GOOD STYLE: 'Could you share the patient's name with me?' 'And the best mobile number to reach you on?' 'What brings you to the clinic today, is it a general checkup or something specific?' 'I have a slot tomorrow morning at eleven thirty with Dr. Priya... does that work for you?'\n"
+            "CLOSE: Ask once if anything else. If no, wish them well ('Have a beautiful day ahead in Namma Bengaluru') and say 'Pranaam and take care!' -> end_call. Never say Namaste at ending."
         ),
     )
     initial_ctx.add_message(
@@ -2535,11 +2560,11 @@ async def entrypoint(ctx: JobContext):
         # than the few tenths of a second it costs. Every turn after the
         # greeting uses the faster session tts_provider to keep per-minute
         # call cost down. Pre-rendered greeting WAV cache only exists for
-        # Sarvam (assets/audio/greetings/ is keyed by Sarvam speaker name).
-        is_sarvam_call = requested_tts_provider == "sarvam"
-        default_voice_for_provider = os.getenv("SARVAM_SPEAKER", "ishita") if is_sarvam_call else (voice_catalog_default(requested_tts_provider) or "")
+        # Sarvam and Gemini (assets/audio/greetings/ is keyed by speaker name).
+        cache_greeting = requested_tts_provider in ["sarvam", "gemini"]
+        default_voice_for_provider = os.getenv("SARVAM_SPEAKER", "ishita") if requested_tts_provider == "sarvam" else (voice_catalog_default(requested_tts_provider) or "")
         active_voice = (requested_voice or default_voice_for_provider).strip().lower()
-        cached_frames = load_cached_greeting(active_voice) if is_sarvam_call else None
+        cached_frames = load_cached_greeting(active_voice) if cache_greeting else None
 
         if not cached_frames:
             # No cache hit - synthesize the greeting once with a slow-paced
@@ -2569,17 +2594,14 @@ async def entrypoint(ctx: JobContext):
         else:
             await session.say(GREETING_TEXT, allow_interruptions=True)
 
-        if is_sarvam_call and not load_cached_greeting(active_voice):
+        if cache_greeting and not load_cached_greeting(active_voice):
             # Render and store this voice's greeting in the background, at the
             # same slow greeting pace, so the next call with it starts
             # speaking instantly.
             try:
-                cache_tts = SarvamTTS(
-                    api_key=required_env("SARVAM_API_KEY"),
-                    speaker=active_voice,
-                    pace=float(os.getenv("SARVAM_PACE_GREETING", "0.9")),
-                )
-                asyncio.create_task(ensure_greeting_cache(active_voice, cache_tts))
+                cache_tts = _build_greeting_tts(requested_tts_provider, active_voice)
+                if cache_tts:
+                    asyncio.create_task(ensure_greeting_cache(active_voice, cache_tts))
             except Exception:
                 logger.warning("Could not schedule greeting cache task", exc_info=True)
         pipeline_event(
