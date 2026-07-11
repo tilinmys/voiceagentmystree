@@ -1,3 +1,10 @@
+import os
+import sys
+
+# Suppress noisy dependency warnings before they load
+os.environ["ORT_LOGGING_LEVEL"] = "3"  # Error only for ONNX
+os.environ["PYTHONWARNINGS"] = "ignore"
+
 import asyncio
 import json
 import logging
