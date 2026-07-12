@@ -11,8 +11,12 @@ clinic-receptionist tone (MyStree Clinic, Indiranagar). Smallest.ai exposes
 hundreds of Indian voices; dumping all of them into a dropdown would be
 unusable and unvetted, so only voices that tested well for tone + reliability
 are listed. Rumik has no fixed voice catalog at all - see the RUMIK_VOICES
-comment below for how that provider's "voices" are constructed. Add more
-only after benchmarking them.
+comment below for how that provider's "voices" are constructed. Gemini's
+voices are Google's standard prebuilt presets (no Indian-accent tagging
+upstream); gemini_wrappers.py steers them toward en-IN via speechConfig's
+languageCode on every request. Four providers total: sarvam, rumik,
+smallest, gemini - see PROVIDERS below. Add more only after benchmarking
+them.
 """
 
 from __future__ import annotations
@@ -129,14 +133,31 @@ CATALOG = {
 
 # Gated so local_server.py can refuse to hand out a token for an unavailable
 # provider (dead-air call) and the UI can disable the option instead of
-# letting someone pick it. All three are currently live and working.
+# letting someone pick it.
+#
+# Verified live 2026-07-12 via scripts/tts_benchmark.py AND a real dispatched
+# call through the actual pipeline (not just the isolated benchmark):
+#   - rumik: every voice fails with HTTP 402 "Insufficient credits. Need 1
+#     credits, have 0" - the account is out of credits. Confirmed in a live
+#     call too - the caller gets several retries then dead air/hangup.
+#   - gemini: every voice fails with HTTP 400 "API key not valid." The
+#     GEMINI_API_KEY in .env doesn't match the standard Google Generative
+#     Language API key format (those start with AIzaSy...) - looks like the
+#     wrong credential was pasted in. Get a real key from
+#     https://aistudio.google.com/apikey.
+# Flip back to True once each is fixed (Rumik: top up credits; Gemini:
+# correct GEMINI_API_KEY) - re-run scripts/tts_benchmark.py to confirm before
+# flipping, don't just trust that the fix "should" work.
 PROVIDER_AVAILABLE = {
     "sarvam": True,
-    "rumik": True,
+    "rumik": False,
     "smallest": True,
-    "gemini": True,
+    "gemini": False,
 }
-PROVIDER_UNAVAILABLE_REASON: dict[str, str] = {}
+PROVIDER_UNAVAILABLE_REASON: dict[str, str] = {
+    "rumik": "Account is out of credits (HTTP 402 on every voice) - top up at rumik.ai then flip PROVIDER_AVAILABLE back to True.",
+    "gemini": "GEMINI_API_KEY is invalid (HTTP 400 on every voice) - get a real key from https://aistudio.google.com/apikey, update .env, then flip PROVIDER_AVAILABLE back to True.",
+}
 
 
 def default_voice(provider: str) -> str | None:

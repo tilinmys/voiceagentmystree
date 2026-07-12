@@ -1,4 +1,4 @@
-"""Benchmark curated Indian TTS voices across Sarvam / Rumik / Smallest.ai
+"""Benchmark curated Indian TTS voices across Sarvam / Rumik / Smallest.ai / Gemini
 to find the fastest + most reliable option for the MyStree Clinic agent.
 
 Supersedes the old Sarvam-vs-60db benchmark - 60db was removed from the
@@ -6,7 +6,7 @@ runtime TTS chain (see CHANGELOG). Hits each provider's HTTP API directly (no
 LiveKit room needed). Measures:
 
   - ttfb_ms: time from request sent to first audio byte received (true
-    time-to-first-byte for Rumik and Smallest.ai, which both stream over
+    time-to-first-byte for Rumik, Smallest.ai, and Gemini, which all stream over
     HTTP). Sarvam's REST endpoint returns one buffered JSON blob (no
     streaming), so its number is full round-trip latency, not TTFB - the
     production path (sarvam_wrappers.py) uses a websocket and is materially
@@ -156,7 +156,46 @@ def bench_smallest(voice_id: str) -> dict:
         return {"error": str(e)}
 
 
-BENCHERS = {"sarvam": bench_sarvam, "rumik": bench_rumik, "smallest": bench_smallest}
+def bench_gemini(voice_id: str) -> dict:
+    key = ENV.get("GEMINI_API_KEY")
+    if not key:
+        return {"error": "GEMINI_API_KEY not configured"}
+    started = time.perf_counter()
+    ttfb_ms = None
+    total_bytes = 0
+    url = "https://generativelanguage.googleapis.com/v1alpha/models/gemini-3.1-flash-tts-preview:streamGenerateContent"
+    try:
+        with requests.post(
+            url,
+            params={"alt": "sse", "key": key},
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"role": "user", "parts": [{"text": TEST_PHRASE}]}],
+                "generationConfig": {
+                    "speechConfig": {
+                        "languageCode": "en-IN",
+                        "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice_id}},
+                    }
+                },
+            },
+            stream=True,
+            timeout=30,
+        ) as resp:
+            if resp.status_code != 200:
+                return {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+            for raw_line in resp.iter_lines():
+                if not raw_line:
+                    continue
+                if ttfb_ms is None:
+                    ttfb_ms = (time.perf_counter() - started) * 1000
+                total_bytes += len(raw_line)
+        total_ms = (time.perf_counter() - started) * 1000
+        return {"ttfb_ms": round(ttfb_ms, 1) if ttfb_ms else None, "total_ms": round(total_ms, 1), "audio_bytes": total_bytes}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+BENCHERS = {"sarvam": bench_sarvam, "rumik": bench_rumik, "smallest": bench_smallest, "gemini": bench_gemini}
 
 
 def run_benchmark(runs: int) -> list[dict]:

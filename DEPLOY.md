@@ -1,11 +1,14 @@
-# Deployment — split hosting (Railway + Vercel)
+# Deployment — split hosting (Render + Vercel)
 
 The LiveKit agent worker (`agent.py`) and the frontend/token API are two
 different kinds of thing and belong on two different platforms:
 
-- **Railway** runs `agent.py` — an always-on process holding a persistent
+- **Render** runs `agent.py` — an always-on process holding a persistent
   connection to LiveKit Cloud, waiting for dispatched call jobs. This is a
-  worker, not a request/response web service.
+  worker, not a request/response web service. **This is the currently
+  deployed setup** (moved here from an earlier Railway attempt - the
+  `railway.json`/Railway-specific notes further down are kept for reference
+  in case that path is revisited, but Render is what's live today).
 - **Vercel** hosts the static preview page (`frontend/local_preview.html`)
   and a small token/dispatch/catalog API (`api/*.py`). Vercel serverless
   functions cannot run `agent.py` itself — no persistent processes, hard
@@ -13,11 +16,57 @@ different kinds of thing and belong on two different platforms:
 
 Vercel's functions never see the TTS/STT/LLM provider keys. They only need
 enough to issue a LiveKit token, create a dispatch, and proxy health/log
-reads to the Railway worker over the public internet.
+reads to the worker over the public internet.
 
 ---
 
-## Railway (the worker)
+## Render (the worker — current setup)
+
+Deploy this whole repo as a Render **Web Service** (not a background worker
+- it needs a public URL for `status_server.py`'s `/health` and `/logs`, same
+reason as the Railway setup below). Render reads the `Procfile`
+(`web: python agent.py start`) automatically, same as Railway does - no
+Render-specific config file needed.
+
+Render-specific fixes already baked in, from real deploys that failed
+without them:
+
+- **`.python-version` pins `3.11.9`.** Render's default Python selection
+  needs an explicit pin or you get a different (often older/newer) version
+  than what this was tested against.
+- **`kittentts` removed from `requirements.txt`.** It bundles model weights
+  and was never actually enabled (`KITTEN_TTS_ENABLED=false`) - pure deploy
+  weight with no runtime benefit. `livekit-plugins-cartesia` and
+  `livekit-plugins-elevenlabs` removed too (Cartesia was already dead per an
+  earlier session's probe returning HTTP 402; ElevenLabs was replaced by
+  Rumik, see CHANGELOG).
+- **`ENABLE_MULTILINGUAL_TURN_DETECTOR` now defaults to `false`** (was
+  `true`). The multilingual turn-detector model is memory-heavy enough to
+  OOM-kill the process on Render's smaller instance tiers. STT-based turn
+  detection is the fallback and is what actually runs unless you explicitly
+  set this env var back to `true` on a large-enough instance.
+- **`status_server.py` answers `GET /` directly** (not just `/health`) with
+  a simple JSON status line - Render's own health checks hit `/` by default,
+  and that was 404ing before this was added, which Render can interpret as
+  an unhealthy service and cycle it.
+- **`ORT_LOGGING_LEVEL`/`PYTHONWARNINGS` suppressed at the top of `agent.py`**
+  to keep Render's log output from being drowned in ONNX/dependency noise.
+
+Give Render **every key currently in your local `.env`** — the full set
+`agent.py` reads: `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`,
+`LIVEKIT_AGENT_NAME`, `OPENAI_API_KEY`, `GROQ_API_KEY(S)`,
+`ASSEMBLYAI_API_KEY`, `DEEPGRAM_API_KEY`, `SARVAM_API_KEY`,
+`SMALLEST_API_KEY`, `RUMIK_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`,
+plus every tuning var already in `.env`/`.env.example` (endpointing delays,
+TTS pace/speed, `STT_KEY_TERMS`, etc.). Once Render gives you a public URL
+for this service, that's your `RAILWAY_WORKER_URL` value for Vercel below
+(the env var name is a holdover from the original Railway setup - it's just
+"the worker's public URL" regardless of which host it's on; renaming it
+isn't worth a breaking config change right now).
+
+---
+
+## Railway (alternative / earlier setup, kept for reference)
 
 Deploy this whole repo. `railway.json` and `Procfile` both set the start
 command to `python agent.py start` (Railway's Railpack builder can't guess a

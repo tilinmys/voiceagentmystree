@@ -2243,7 +2243,7 @@ async def entrypoint(ctx: JobContext):
             room=getattr(ctx.room, "name", None),
         )
 
-        # The caller's UI can pick a TTS provider (Sarvam/Rumik/Smallest)
+        # The caller's UI can pick a TTS provider (Sarvam/Rumik/Smallest/Gemini)
         # and a voice within it. Prefer dispatch/job metadata because it
         # exists before the browser participant metadata is synced;
         # participant metadata is only a fallback. This prevents the worker

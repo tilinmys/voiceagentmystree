@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -133,10 +134,9 @@ class _ChunkedStream(tts.ChunkedStream):
                     num_channels=NUM_CHANNELS,
                     mime_type="audio/pcm",
                 )
-                
-                import json
+
                 async for line in resp.content:
-                    line = line.decode('utf-8').strip()
+                    line = line.decode("utf-8").strip()
                     if line.startswith("data: "):
                         data_str = line[len("data: "):]
                         if data_str == "[DONE]":
@@ -146,8 +146,8 @@ class _ChunkedStream(tts.ChunkedStream):
                             b64_data = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
                             pcm_bytes = base64.b64decode(b64_data)
                             output_emitter.push(pcm_bytes)
-                        except (KeyError, IndexError, ValueError):
-                            pass
+                        except (KeyError, IndexError, ValueError) as e:
+                            logger.warning("Skipping malformed Gemini SSE chunk: %s (%s)", e, data_str[:200])
 
             output_emitter.flush()
 
