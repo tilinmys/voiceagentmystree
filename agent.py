@@ -6,11 +6,14 @@ os.environ["ORT_LOGGING_LEVEL"] = "3"  # Error only for ONNX
 os.environ["PYTHONWARNINGS"] = "ignore"
 
 import asyncio
+import atexit
 import json
 import logging
 import os
+import queue
 import random
 import re
+import threading
 import time
 import traceback
 from collections import OrderedDict
@@ -87,6 +90,63 @@ def _jsonable(value):
     return str(value)
 
 
+# Pipeline events used to open+write+close the log file synchronously inside
+# every call - including once per interim STT transcript, several times a
+# second while the caller speaks, all on the asyncio event loop. A bounded
+# queue drained by one daemon writer thread keeps the hot path to a dict
+# construction and a lock-free put. Format on disk is unchanged. If the queue
+# is ever full (writer stalled), the event is dropped with a stderr note
+# rather than blocking the call path - these logs are observability, not
+# call-critical state.
+_PIPELINE_QUEUE: "queue.Queue[dict | None]" = None  # type: ignore[assignment]
+_PIPELINE_WRITER: "threading.Thread | None" = None
+
+
+def _pipeline_writer_loop() -> None:
+    while True:
+        event = _PIPELINE_QUEUE.get()
+        if event is None:  # shutdown sentinel
+            return
+        try:
+            PIPELINE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with PIPELINE_LOG_PATH.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, default=_jsonable, ensure_ascii=True) + "\n")
+                # Drain whatever else queued while we held the handle open.
+                while True:
+                    try:
+                        extra = _PIPELINE_QUEUE.get_nowait()
+                    except queue.Empty:
+                        break
+                    if extra is None:
+                        return
+                    handle.write(json.dumps(extra, default=_jsonable, ensure_ascii=True) + "\n")
+        except Exception:
+            logger.warning("Unable to write pipeline event", exc_info=True)
+
+
+def _ensure_pipeline_writer() -> None:
+    global _PIPELINE_QUEUE, _PIPELINE_WRITER
+    if _PIPELINE_WRITER is not None and _PIPELINE_WRITER.is_alive():
+        return
+    if _PIPELINE_QUEUE is None:
+        _PIPELINE_QUEUE = queue.Queue(maxsize=int(os.getenv("PIPELINE_LOG_QUEUE_MAX", "2000")))
+    _PIPELINE_WRITER = threading.Thread(target=_pipeline_writer_loop, name="pipeline-log-writer", daemon=True)
+    _PIPELINE_WRITER.start()
+    atexit.register(_flush_pipeline_events)
+
+
+def _flush_pipeline_events() -> None:
+    """Best-effort drain on shutdown so tail-of-call events are not lost."""
+    if _PIPELINE_QUEUE is None:
+        return
+    try:
+        _PIPELINE_QUEUE.put_nowait(None)
+    except queue.Full:
+        pass
+    if _PIPELINE_WRITER is not None:
+        _PIPELINE_WRITER.join(timeout=3.0)
+
+
 def pipeline_event(stage_key: str, status: str, label: str, message: str, **details) -> None:
     event = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -96,12 +156,11 @@ def pipeline_event(stage_key: str, status: str, label: str, message: str, **deta
         "message": message,
         "details": details,
     }
+    _ensure_pipeline_writer()
     try:
-        PIPELINE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with PIPELINE_LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, default=_jsonable, ensure_ascii=True) + "\n")
-    except Exception:
-        logger.warning("Unable to write pipeline event", exc_info=True)
+        _PIPELINE_QUEUE.put_nowait(event)
+    except queue.Full:
+        print("pipeline event queue full; dropping event", file=sys.stderr)
 
     log_method = logger.error if status == "error" else logger.warning if status == "warn" else logger.info
     log_method("[PIPELINE] %s %s %s - %s %s", event["stage"], status, label, message, details or "")
@@ -176,6 +235,7 @@ from livekit.agents import (
     PreemptiveGenerationOptions,
     RoomInputOptions,
     RunContext,
+    StopResponse,
     TurnHandlingOptions,
     WorkerOptions,
     cli,
@@ -528,12 +588,37 @@ class SlotCache:
     def __init__(self) -> None:
         self._slots: list[dict] = []
         self._refresh_task: asyncio.Task | None = None
+        self._inflight_refresh: asyncio.Task | None = None
 
     async def refresh(self) -> None:
         try:
             self._slots = await asyncio.to_thread(db_helper.get_open_slots)
         except Exception:
             logger.warning("Slot cache refresh failed", exc_info=True)
+
+    def refresh_soon(self, reason: str) -> None:
+        """Supervised fire-and-forget refresh, deduplicated to one in flight.
+
+        Used after booking/reschedule/cancel writes so the spoken confirmation
+        is never blocked behind a full slot-table re-read (measured at up to
+        ~1.9s). Safe because the write itself already went through the atomic
+        DB path - the cache is only for suggestions, and any subsequent
+        booking attempt re-verifies against the database, so a momentarily
+        stale suggestion can never produce a double booking.
+        """
+        if self._inflight_refresh is not None and not self._inflight_refresh.done():
+            return
+
+        async def _run() -> None:
+            started = time.perf_counter()
+            await self.refresh()  # refresh() already swallows/logs its own errors
+            pipeline_event(
+                "tools", "ok", "Slot cache refreshed in background", reason,
+                duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                slots=len(self._slots),
+            )
+
+        self._inflight_refresh = asyncio.create_task(_run())
 
     def start_background_refresh(self, interval: float) -> None:
         async def _loop() -> None:
@@ -548,6 +633,9 @@ class SlotCache:
         if self._refresh_task is not None:
             self._refresh_task.cancel()
             self._refresh_task = None
+        if self._inflight_refresh is not None and not self._inflight_refresh.done():
+            self._inflight_refresh.cancel()
+            self._inflight_refresh = None
 
     @staticmethod
     def _slot_dt(slot: dict) -> datetime:
@@ -601,6 +689,79 @@ class SlotCache:
 
 
 slot_cache = SlotCache()
+
+
+class TurnLatencyAggregator:
+    """Correlates per-provider metrics (EOU, LLM, TTS) by speech_id and emits
+    ONE structured `turn_latency` event per conversational turn, so latency
+    percentiles can be computed offline (scripts/latency_report.py) instead
+    of eyeballing three separate log lines per turn.
+
+    The individual metric events are unchanged - this only adds a summary.
+    A turn is emitted when its first TTS metric arrives (= first audio for
+    that reply) or evicted quietly after _MAX_PENDING turns to bound memory.
+    """
+
+    _MAX_PENDING = 32
+
+    def __init__(self) -> None:
+        self._turns: OrderedDict[str, dict] = OrderedDict()
+        self.cancelled_generations = 0
+        self.turns_emitted = 0
+
+    def _turn(self, speech_id: str) -> dict:
+        if speech_id not in self._turns:
+            self._turns[speech_id] = {"speech_id": speech_id, "fallback_used": False, "cancelled_generation": False}
+            while len(self._turns) > self._MAX_PENDING:
+                self._turns.popitem(last=False)
+        return self._turns[speech_id]
+
+    def on_metric(self, m) -> None:
+        metric_type = getattr(m, "type", "")
+        speech_id = getattr(m, "speech_id", "") or ""
+        if not speech_id:
+            return
+        turn = self._turn(speech_id)
+        if getattr(m, "cancelled", False):
+            turn["cancelled_generation"] = True
+            self.cancelled_generations += 1
+        if metric_type == "eou_metrics":
+            turn["eou_delay_ms"] = round(getattr(m, "end_of_utterance_delay", 0) * 1000, 1)
+            turn["stt_final_ms"] = round(getattr(m, "transcription_delay", 0) * 1000, 1)
+        elif metric_type == "llm_metrics":
+            turn["llm_ttft_ms"] = round(getattr(m, "ttft", 0) * 1000, 1)
+            turn["llm_total_ms"] = round(getattr(m, "duration", 0) * 1000, 1)
+        elif metric_type == "tts_metrics" and "tts_ttfa_ms" not in turn:
+            turn["tts_ttfa_ms"] = round(getattr(m, "ttfb", 0) * 1000, 1)
+            self._emit(speech_id, turn)
+
+    def _emit(self, speech_id: str, turn: dict) -> None:
+        self._turns.pop(speech_id, None)
+        self.turns_emitted += 1
+        eou = turn.get("eou_delay_ms") or 0.0
+        ttft = turn.get("llm_ttft_ms") or 0.0
+        ttfa = turn.get("tts_ttfa_ms") or 0.0
+        # Composition estimate: end of user speech -> first playable audio.
+        # response_path is "llm" when an LLM ran for this speech, otherwise the
+        # reply came from say()/deterministic paths.
+        first_audio_total = round(eou + ttft + ttfa, 1)
+        pipeline_event(
+            "turn", "ok", "Turn latency", "per-turn latency summary",
+            event="turn_latency",
+            speech_id=speech_id,
+            stt_final_ms=turn.get("stt_final_ms"),
+            eou_delay_ms=turn.get("eou_delay_ms"),
+            llm_ttft_ms=turn.get("llm_ttft_ms"),
+            llm_total_ms=turn.get("llm_total_ms"),
+            tts_ttfa_ms=turn.get("tts_ttfa_ms"),
+            first_audio_total_ms=first_audio_total,
+            response_path="llm" if "llm_ttft_ms" in turn else "deterministic",
+            cancelled_generation=turn.get("cancelled_generation", False),
+            cancelled_generations_so_far=self.cancelled_generations,
+        )
+
+
+turn_latency = TurnLatencyAggregator()
 
 
 _INVALID_PATIENT_NAME_TOKENS = {
@@ -1415,10 +1576,16 @@ async def book_appointment(ctx: RunContext, name: str, phone: str, doctor_name: 
             date,
             slot_time,
         )
-        await slot_cache.refresh()
         booking_prefetch.invalidate_phone(phone)
 
         if appointment_id is not None:
+            # Success: the confirmation must not wait on a full slot-table
+            # re-read (measured up to ~1.9s). The write is already committed
+            # atomically; refresh the suggestion cache in the background.
+            if env_flag("VOICE_ASYNC_SLOT_REFRESH_ENABLED", True):
+                slot_cache.refresh_soon("post-booking")
+            else:
+                await slot_cache.refresh()
             return (
                 f"Booked. Appointment ID {appointment_id} with {doctor_name} "
                 f"on {friendly_date(date)} at {friendly_time(slot_time)}. "
@@ -1426,6 +1593,10 @@ async def book_appointment(ctx: RunContext, name: str, phone: str, doctor_name: 
                 "Read the ID digit by digit to the caller."
             )
 
+        # Failure: refresh synchronously BEFORE suggesting alternatives - the
+        # stale cache may still contain the exact slot the DB just refused,
+        # and offering it back to the caller would be worse than the wait.
+        await slot_cache.refresh()
         nearest = slot_cache.nearest(doctor_name, date, slot_time, k=3)
         options = "; ".join(_slot_phrase(s) for s in nearest) if nearest else "none this week"
         if reason == "taken":
@@ -1466,14 +1637,22 @@ async def reschedule_appointment(ctx: RunContext, appointment_id: int, new_date:
             new_date,
             slot_time,
         )
-        await slot_cache.refresh()
         if ok:
+            # Success confirmation must not wait on the suggestion-cache
+            # re-read; the reschedule is already committed atomically.
+            if env_flag("VOICE_ASYNC_SLOT_REFRESH_ENABLED", True):
+                slot_cache.refresh_soon("post-reschedule")
+            else:
+                await slot_cache.refresh()
             return (
                 f"Rescheduled. Appointment ID {appointment_id} is now on "
                 f"{friendly_date(new_date)} at {friendly_time(slot_time)}. Confirm it back to the caller."
             )
         if reason == "not_found":
             return "No scheduled appointment with that ID. Verify the appointment first."
+        # Failure: refresh synchronously before suggesting alternatives so we
+        # never re-offer the slot the DB just refused.
+        await slot_cache.refresh()
         nearest = slot_cache.nearest(None, new_date, slot_time, k=3)
         options = "; ".join(_slot_phrase(s) for s in nearest) if nearest else "none nearby"
         if reason == "doctor_unavailable":
@@ -1498,7 +1677,12 @@ async def cancel_appointment(ctx: RunContext, appointment_id: int, reason: str =
             appointment_id,
             reason or None,
         )
-        await slot_cache.refresh()
+        # Cancelling only FREES a slot - a briefly stale cache just doesn't
+        # show the newly freed slot yet, which can never mislead a caller.
+        if env_flag("VOICE_ASYNC_SLOT_REFRESH_ENABLED", True):
+            slot_cache.refresh_soon("post-cancel")
+        else:
+            await slot_cache.refresh()
         if success:
             return f"Appointment {appointment_id} has been cancelled and the slot is free again."
         return f"Appointment ID {appointment_id} was not found or is already cancelled."
@@ -1789,7 +1973,7 @@ def build_llm() -> llm.LLM:
                 model=groq_model,
                 api_key=groq_key,
                 base_url=groq_base_url,
-                max_completion_tokens=int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "60")),
+                max_completion_tokens=int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "90")),
                 temperature=float(os.getenv("LLM_TEMPERATURE", "0.25")),
                 max_retries=0,
             )
@@ -1808,7 +1992,7 @@ def build_llm() -> llm.LLM:
     openai_fallback = openai.LLM(
         model=openai_model,
         api_key=required_env("OPENAI_API_KEY"),
-        max_completion_tokens=int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "60")),
+        max_completion_tokens=int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "90")),
         temperature=float(os.getenv("LLM_TEMPERATURE", "0.25")),
         max_retries=0,
     )
@@ -2156,6 +2340,90 @@ def build_initial_context(preloaded_user: dict | None = None) -> llm.ChatContext
     )
     return initial_ctx
 
+
+# --- Deterministic fast path -------------------------------------------------
+# A conversational LLM round-trip costs 700-1,300ms of TTFT before the caller
+# hears anything. For a small set of unambiguous, state-free turns we can skip
+# the LLM entirely and speak a canned reply in one hop. Deliberately narrow:
+# only cases where the correct reply is derivable from the user text plus the
+# agent's own last utterance, with zero clinic-state judgement involved.
+# Bare "yes"/"no" are NOT handled here - the right reply to "yes" depends on
+# conversation state this codebase doesn't explicitly track, and a wrong
+# deterministic answer in a clinic booking is worse than 1s of latency.
+# Everything else falls through to the normal LLM path untouched.
+
+_FAST_REPEAT_RE = re.compile(
+    r"^(?:sorry[,.!]?\s*)?(?:can you\s+|could you\s+|please\s+)*"
+    r"(?:repeat(?:\s+that)?|say\s+(?:that|it)\s+again|pardon(?:\s+me)?|come\s+again|once\s+more"
+    r"|(?:i\s+)?(?:didn'?t|did\s+not|couldn'?t)\s+(?:hear|catch|get)\s+(?:that|you|it))"
+    r"[\s.?!]*$",
+    re.IGNORECASE,
+)
+_FAST_PHONE_PROMPT_RE = re.compile(r"\b(number|phone|mobile|reach you)\b", re.IGNORECASE)
+# Words a caller naturally wraps around a bare phone number.
+_FAST_PHONE_FILLER_RE = re.compile(
+    r"[\d\s\-+.,]|\b(?:my|the|number|phone|mobile|is|it'?s|its|ji|haan|yes|ok|okay)\b", re.IGNORECASE
+)
+
+
+def fast_path_reply(user_text: str, last_agent_text: str) -> tuple[str, str] | None:
+    """Return (kind, reply) for a turn we can answer without the LLM, else None."""
+    text = (user_text or "").strip()
+    if not text:
+        return None
+
+    if last_agent_text and _FAST_REPEAT_RE.match(text):
+        return ("repeat", f"Of course... {last_agent_text}")
+
+    # A bare phone number, spoken right after we asked for the number: echo it
+    # back digit-by-digit for confirmation (exactly what the prompt tells the
+    # LLM to do anyway, minus the LLM round trip).
+    if last_agent_text and _FAST_PHONE_PROMPT_RE.search(last_agent_text):
+        phone = extract_phone_candidate(text)
+        if phone:
+            digits_only = re.sub(r"\D", "", db_helper.normalize_phone(phone))[-10:]
+            leftover = _FAST_PHONE_FILLER_RE.sub("", text).strip()
+            if len(digits_only) == 10 and not leftover:
+                spoken = "-".join(digits_only)
+                return ("phone_confirm", f"Thank you... just to confirm, that's {spoken}... is that right?")
+
+    return None
+
+
+class GracyAgent(Agent):
+    """Agent subclass adding the deterministic fast path via the framework's
+    own on_user_turn_completed hook. Raising StopResponse skips LLM generation
+    for this turn only; session.say() records the spoken reply in the chat
+    history, so the LLM sees a coherent transcript on the next turn.
+    """
+
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        if not env_flag("VOICE_FAST_PATH_ENABLED", True):
+            return
+        try:
+            user_text = new_message.text_content or ""
+            last_agent_text = ""
+            for item in reversed(turn_ctx.items):
+                if getattr(item, "role", None) == "assistant":
+                    last_agent_text = item.text_content or ""
+                    break
+            decision = fast_path_reply(user_text, last_agent_text)
+        except Exception:
+            # Router bugs must never take down a turn - fall through to the LLM.
+            logger.warning("Fast-path router failed; using LLM for this turn", exc_info=True)
+            return
+        if decision is None:
+            return
+        kind, reply = decision
+        pipeline_event(
+            "llm", "ok", "Deterministic fast path",
+            f"Turn answered without LLM ({kind})",
+            event="fast_path", response_path="deterministic", kind=kind,
+        )
+        self.session.say(reply, allow_interruptions=True)
+        raise StopResponse()
+
+
 def prewarm_process(proc: JobProcess) -> None:
     try:
         vad_started = time.perf_counter()
@@ -2374,6 +2642,7 @@ async def entrypoint(ctx: JobContext):
         def _on_metrics_collected(ev: MetricsCollectedEvent):
             metrics.log_metrics(ev.metrics)
             usage_collector.collect(ev.metrics)
+            turn_latency.on_metric(ev.metrics)
             metric_type = getattr(ev.metrics, "type", "")
             stage_key, label = _metric_stage(metric_type)
             status = "warn" if getattr(ev.metrics, "cancelled", False) else "ok"
@@ -2532,7 +2801,7 @@ async def entrypoint(ctx: JobContext):
         asyncio.create_task(_preload_slots())
         slot_cache.start_background_refresh(float(os.getenv("SLOT_CACHE_REFRESH_SECONDS", "10")))
 
-        agent = Agent(
+        agent = GracyAgent(
             instructions="You are a human receptionist for MyStree Clinic. Never call yourself an AI.",
             chat_ctx=build_initial_context(await preload_task),
         )
@@ -2632,8 +2901,12 @@ async def entrypoint(ctx: JobContext):
                 env_flag("ENABLE_LINE_LIVE_CHECK", True)
                 and state_watch["agent"] == "listening"
                 and state_watch["user"] != "speaking"
-                and silence_s > float(os.getenv("LINE_LIVE_CHECK_SECONDS", "7.0"))
-                and ping_gap_s > float(os.getenv("LINE_LIVE_CHECK_COOLDOWN_SECONDS", "25.0"))
+                # A queued/active agent speech means we are not actually idle
+                # even if the state string briefly reads "listening" - firing
+                # here is how the check used to collide with agent audio.
+                and session.current_speech is None
+                and silence_s > float(os.getenv("LINE_LIVE_CHECK_SECONDS", "14.0"))
+                and ping_gap_s > float(os.getenv("LINE_LIVE_CHECK_COOLDOWN_SECONDS", "30.0"))
             ):
                 state_watch["last_ping"] = now
                 phrase = os.getenv(

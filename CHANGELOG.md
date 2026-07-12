@@ -5,6 +5,77 @@ Companion docs: [CALL_FLOW.md](CALL_FLOW.md) (conversation wireframe), [LATENCY_
 
 ---
 
+## -2. 2026-07-13 — Production-safe latency pass (flagged, reversible)
+
+Baseline from real call logs before this pass (`logs/latency_baseline_before.txt`):
+EOU delay p50 513ms / p95 1197ms; LLM TTFT p50 1051ms / p95 1289ms; TTS TTFA
+p50 585ms / p95 1049ms. All changes are additive and each has a kill-switch.
+
+- **TTS first audio ~2x faster (biggest win)**: `smallest_wrappers.py` now uses
+  Smallest.ai's SSE `/lightning-v3.1/stream` endpoint, which sends audio while
+  synthesis is still running server-side, instead of `/get_speech` which only
+  responds after the whole utterance is done. Measured through the real
+  LiveKit `ChunkedStream` interface, warm connections, interleaved runs:
+  first frame **260–280ms (SSE) vs 545–657ms (buffered)**, identical audio
+  duration per round. Kill switch: `VOICE_INCREMENTAL_TTS_ENABLED=false`
+  falls back to the buffered path unchanged.
+- **Blocking slot refresh removed from confirmations**: `book_appointment`,
+  `reschedule_appointment`, and `cancel_appointment` used to
+  `await slot_cache.refresh()` (a full slot-table re-read, observed up to
+  ~1.9s) between the committed DB write and the spoken confirmation. Success
+  paths now use `SlotCache.refresh_soon()` — supervised, single-flight,
+  fire-and-forget. **Failure paths still refresh synchronously on purpose**:
+  when a slot was just refused, the alternatives we offer must not include
+  the slot the DB just rejected. Booking correctness is untouched — writes
+  were always atomic at the DB layer; the cache is suggestions-only.
+  Kill switch: `VOICE_ASYNC_SLOT_REFRESH_ENABLED=false`.
+- **Deterministic fast path (no LLM round-trip) for two state-free turns**:
+  new `GracyAgent(Agent)` subclass hooks the framework's own
+  `on_user_turn_completed` + `StopResponse`. Handles ONLY (a) repeat requests
+  ("can you repeat that?" → replays the last agent utterance) and (b) a bare
+  phone number spoken right after the agent asked for the number → instant
+  digit-by-digit echo confirmation (exactly what the prompt instructs the LLM
+  to do, minus its 700–1300ms TTFT). Bare "yes"/"no" are deliberately NOT
+  handled — the right reply depends on conversation state this codebase does
+  not explicitly track, and a wrong canned answer in a clinic call is worse
+  than one second of latency. 28 unit tests in `tests/test_fast_path.py`,
+  negative cases included. Kill switch: `VOICE_FAST_PATH_ENABLED=false`.
+- **Pipeline log writes off the event loop**: `pipeline_event()` used to
+  open/write/close `pipeline_events.jsonl` synchronously per event — several
+  times a second during caller speech (once per interim transcript), all on
+  the asyncio loop. Now a bounded queue (`PIPELINE_LOG_QUEUE_MAX`, default
+  2000) drained by one daemon writer thread, drained on shutdown via atexit;
+  on-disk format unchanged.
+- **Per-turn latency summary + percentile reporting**: new
+  `TurnLatencyAggregator` correlates EOU/LLM/TTS metrics by `speech_id` and
+  emits one structured `turn_latency` event per turn (stt_final_ms,
+  eou_delay_ms, llm_ttft_ms, llm_total_ms, tts_ttfa_ms,
+  first_audio_total_ms, response_path, cancelled_generation). Existing
+  per-metric events unchanged. New `scripts/latency_report.py` prints
+  p50/p75/p95 from the log (also reads raw metric events from pre-aggregator
+  logs).
+- **Line-live check collisions fixed**: silence threshold default 7s → 14s,
+  cooldown 25s → 30s (env names unchanged), plus a `session.current_speech is
+  None` guard so the check can never fire while agent audio is queued or
+  playing. Interim transcripts already reset the silence timer.
+- **Endpointing restored to the natural band**: the `.env` restructure had
+  dropped the old `MIN_ENDPOINTING_DELAY=0.05` override (which committed to
+  turns the caller hadn't finished → cancelled generations); code default
+  0.3s now applies and `.env.example` documents 0.3 with the reasoning.
+  Also restored `LLM_MAX_COMPLETION_TOKENS` default 60 → 90 (the earlier
+  humanization setting lost in the same restructure).
+
+**Deliberately NOT done, and why** — Phase 4 heavy prompt surgery: OpenAI
+prompt caching is already active (~2048 tokens cached per turn) and the
+system prompt was already compacted to ~1350 tokens in an earlier pass;
+further cuts risk behavior for little TTFT gain. Phase 8 hedged LLM
+requests: `llm.FallbackAdapter` already fails over on a 2.0s attempt
+timeout; a custom hedging layer would replace working fallback logic.
+Full ConversationState machine: not built — the narrow fast path was chosen
+specifically because bare yes/no routing without real state is unsafe.
+
+---
+
 ## -1. 2026-07-10 — Multi-provider TTS selection (Sarvam / ElevenLabs / Smallest.ai)
 
 - **New**: [voice_catalog.py](voice_catalog.py) is the single source of truth for TTS provider/voice catalogs, shared by `agent.py` and `frontend/local_server.py`. Curated (not auto-fetched) shortlists: 14 Sarvam speakers, 12 ElevenLabs Indian voices (from ElevenLabs' 807-voice shared library, filtered `accent=indian, use_case=conversational`), 12 Smallest.ai Indian voices (from their 108-voice Indian catalog).

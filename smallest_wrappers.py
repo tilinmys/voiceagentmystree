@@ -21,6 +21,8 @@ calling synthesize(), so playback still starts well under a second in.
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -109,9 +111,19 @@ class _ChunkedStream(tts.ChunkedStream):
         self._tts: SmallestTTS = tts
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        # SSE /stream delivers the first audio chunk while the rest is still
+        # being synthesized server-side; /get_speech only starts sending after
+        # the whole utterance is done. Measured with warm connections
+        # (2026-07-12, voice maithili, 57-char phrase, 3 runs each):
+        # SSE first audio ~506-519ms vs get_speech first byte ~826-875ms.
+        # VOICE_INCREMENTAL_TTS_ENABLED=false falls back to the buffered path.
+        if os.getenv("VOICE_INCREMENTAL_TTS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}:
+            await self._run_sse(output_emitter)
+        else:
+            await self._run_buffered(output_emitter)
+
+    def _request_args(self) -> tuple[dict, dict]:
         opts = self._tts._opts
-        session = self._tts._ensure_session()
-        url = f"{opts.base_url}/{opts.model}/get_speech"
         payload = {
             "text": self.input_text,
             "voice_id": opts.voice_id,
@@ -122,10 +134,78 @@ class _ChunkedStream(tts.ChunkedStream):
             "Authorization": f"Bearer {opts.api_key}",
             "Content-Type": "application/json",
         }
+        return payload, headers
+
+    async def _run_sse(self, output_emitter: tts.AudioEmitter) -> None:
+        opts = self._tts._opts
+        session = self._tts._ensure_session()
+        payload, headers = self._request_args()
 
         try:
             async with session.post(
-                url,
+                f"{opts.base_url}/{opts.model}/stream",
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(
+                    total=30, sock_connect=self._conn_options.timeout
+                ),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise APIStatusError(
+                        message=f"Smallest.ai TTS stream error: {body[:300]}",
+                        status_code=resp.status,
+                        request_id=None,
+                        body=body[:500],
+                    )
+
+                output_emitter.initialize(
+                    request_id=resp.headers.get("x-request-id", ""),
+                    sample_rate=opts.sample_rate,
+                    num_channels=NUM_CHANNELS,
+                    mime_type="audio/pcm",
+                )
+                got_audio = False
+                async for raw_line in resp.content:
+                    line = raw_line.strip()
+                    if not line.startswith(b"data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if not data_str or data_str == b"[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(data_str)
+                        b64_audio = chunk.get("audio")
+                        if b64_audio:
+                            output_emitter.push(base64.b64decode(b64_audio))
+                            got_audio = True
+                    except (ValueError, KeyError) as e:
+                        logger.warning("Skipping malformed Smallest SSE chunk: %s (%s)", e, data_str[:120])
+
+                if not got_audio:
+                    raise APIConnectionError("Smallest.ai SSE stream produced no audio")
+
+            output_emitter.flush()
+
+        except APIStatusError:
+            raise
+        except aiohttp.ClientConnectionError as e:
+            raise APIConnectionError() from e
+        except TimeoutError as e:
+            raise APITimeoutError() from e
+        except APIConnectionError:
+            raise
+        except Exception as e:
+            raise APIConnectionError(f"Smallest.ai TTS stream request failed: {e}") from e
+
+    async def _run_buffered(self, output_emitter: tts.AudioEmitter) -> None:
+        opts = self._tts._opts
+        session = self._tts._ensure_session()
+        payload, headers = self._request_args()
+
+        try:
+            async with session.post(
+                f"{opts.base_url}/{opts.model}/get_speech",
                 json=payload,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(
