@@ -5,6 +5,40 @@ Companion docs: [CALL_FLOW.md](CALL_FLOW.md) (conversation wireframe), [LATENCY_
 
 ---
 
+## -3. 2026-07-13 — LLM speed comparison, Groq qwen3-32b promoted to primary
+
+Compared `openai/gpt-4o-mini` (was primary), `groq/llama-3.1-8b-instant` (was
+fallback), `groq/qwen3-32b`, and `gemini-2.5-flash`, streaming, using the
+real clinic system prompt (~1180 tokens), 8 requests each, three separate
+full runs for consistency (new `scripts/llm_benchmark.py`):
+
+| Model | TTFT p50 | TTFT p95 |
+|---|---:|---:|
+| **groq/qwen3-32b** | **270–358ms** | 301–522ms |
+| groq/llama-3.1-8b-instant | 320–401ms | 518–560ms |
+| openai/gpt-4o-mini | 1000–1182ms | 1204–2121ms |
+| gemini-2.5-flash | 1451–1516ms | 1758–1931ms, also hit 429 quota mid-run |
+
+`groq/qwen3-32b` won consistently across all three runs - ~3.5x faster than
+the previous OpenAI primary. No code change needed: `build_llm()` already
+had `GROQ_PRIMARY` and `GROQ_LLM_MODEL` env vars for exactly this. Flipped
+`GROQ_PRIMARY=true` and `GROQ_LLM_MODEL=qwen/qwen3-32b` in `.env`; OpenAI
+stays configured as fallback, unchanged. Verified live in a real dispatched
+call (pipeline logs show `groq primary + openai fallback`, model
+`qwen/qwen3-32b`, no errors) and against the full 37-test DB suite.
+
+**Found and fixed while investigating why Gemini kept failing "API key not
+valid" despite a corrected key being placed in `.env`**: a stray, untracked
+`.env` file existed directly inside the repo root
+(`mystreevoiceagentiog/.env`, 72 bytes, one line) containing an old,
+invalid `GEMINI_API_KEY`. `load_project_env()` checks the repo-root `.env`
+*before* the real one a directory up, and `load_dotenv(..., override=False)`
+means whichever file loads first wins on key collisions - so this stray
+file was silently shadowing every fix made to the real `.env` for that one
+key. Confirmed via `git log` it was never committed (already gitignored).
+Deleted. If `GEMINI_API_KEY` (or any single key) seems to "not take" after
+an edit, check for this file first before assuming the edit was wrong.
+
 ## -2. 2026-07-13 — Production-safe latency pass (flagged, reversible)
 
 Baseline from real call logs before this pass (`logs/latency_baseline_before.txt`):
