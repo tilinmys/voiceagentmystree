@@ -147,6 +147,12 @@ CANDIDATES = {
     "groq/qwen3-32b (candidate)": lambda: bench_openai_compatible(
         "groq", "https://api.groq.com/openai/v1", ENV.get("GROQ_API_KEY", ""), "qwen/qwen3-32b"
     ),
+    "groq/allam-2-7b (smallest available)": lambda: bench_openai_compatible(
+        "groq", "https://api.groq.com/openai/v1", ENV.get("GROQ_API_KEY", ""), "allam-2-7b"
+    ),
+    "groq/openai-gpt-oss-20b (currently configured)": lambda: bench_openai_compatible(
+        "groq", "https://api.groq.com/openai/v1", ENV.get("GROQ_API_KEY", ""), "openai/gpt-oss-20b"
+    ),
     "gemini-2.5-flash (candidate)": lambda: bench_gemini("gemini-2.5-flash"),
 }
 

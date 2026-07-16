@@ -28,6 +28,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import db_helper
+import voice_catalog
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 PIPELINE_LOG_PATH = Path(os.getenv("PIPELINE_LOG_PATH", "logs/pipeline_events.jsonl"))
 WORKER_LOG_PATH = PROJECT_ROOT / "logs" / "worker_background.log"
@@ -92,6 +95,73 @@ def worker_status() -> dict:
     return {"ready": True, "reason": "worker registered", "last_ready": last_ready_line}
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def provider_summary() -> dict:
+    """Env-only snapshot of what agent.py's build_stt()/build_llm() would
+    construct - no provider objects are built here (no API calls, no
+    side effects), so this is safe to call on every UI page load. Mirrors
+    the exact env vars and defaults those functions read; if this drifts
+    from agent.py, the defaults below should be updated to match.
+    """
+    groq_primary = _env_flag("GROQ_PRIMARY", False)
+    groq_model = os.getenv("GROQ_LLM_MODEL", "openai/gpt-oss-20b")
+    openai_model = os.getenv("OPENAI_LLM_MODEL", os.getenv("LLM_MODEL", "gpt-4o-mini"))
+    raw_multi = os.getenv("GROQ_API_KEYS", "")
+    groq_key_count = len([k for k in raw_multi.split(",") if k.strip()])
+    if not groq_key_count and os.getenv("GROQ_API_KEY"):
+        groq_key_count = 1
+
+    stt_primary_deepgram = os.getenv("STT_PRIMARY", "deepgram").strip().lower() == "deepgram"
+    deepgram_model = os.getenv("DEEPGRAM_STT_MODEL", "nova-3")
+    assemblyai_model = os.getenv("ASSEMBLYAI_STT_MODEL", "universal-3-5-pro")
+
+    llm_primary = (
+        {"provider": "groq", "model": groq_model, "key_count": groq_key_count}
+        if groq_primary and groq_key_count
+        else {"provider": "openai", "model": openai_model}
+    )
+    llm_fallback = (
+        {"provider": "openai", "model": openai_model}
+        if groq_primary and groq_key_count
+        else {"provider": "groq", "model": groq_model, "key_count": groq_key_count}
+    )
+
+    return {
+        "llm": {"primary": llm_primary, "fallback": llm_fallback},
+        "stt": {
+            "primary": {
+                "provider": "deepgram" if stt_primary_deepgram else "assemblyai",
+                "model": deepgram_model if stt_primary_deepgram else assemblyai_model,
+            },
+            "fallback": {
+                "provider": "assemblyai" if stt_primary_deepgram else "deepgram",
+                "model": assemblyai_model if stt_primary_deepgram else deepgram_model,
+            },
+        },
+        "turn_detection": {
+            "mode": os.getenv("VOICE_TURN_DETECTION_MODE", "vad"),
+            "min_endpointing_delay_s": float(os.getenv("MIN_ENDPOINTING_DELAY", "0.35")),
+            "max_endpointing_delay_s": float(os.getenv("MAX_ENDPOINTING_DELAY", "1.2")),
+        },
+        "features": {
+            "fast_path_enabled": _env_flag("VOICE_FAST_PATH_ENABLED", True),
+            "filler_threshold_ms": int(os.getenv("VOICE_FILLER_THRESHOLD_MS", "900")),
+            "async_slot_refresh_enabled": _env_flag("VOICE_ASYNC_SLOT_REFRESH_ENABLED", True),
+            "incremental_tts_enabled": _env_flag("VOICE_INCREMENTAL_TTS_ENABLED", True),
+        },
+    }
+
+
+def config_payload() -> dict:
+    return {"providers": provider_summary(), "tts_catalog": voice_catalog.as_json_catalog()}
+
+
 def _read_logs(since: int) -> dict:
     lines = []
     if PIPELINE_LOG_PATH.exists():
@@ -131,6 +201,32 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.path in {"/health", "/api/worker-status"}:
             self._send_json(worker_status())
             return
+        if parsed.path in {"/config", "/api/config"}:
+            self._send_json(config_payload())
+            return
+        if parsed.path in {"/doctors", "/api/doctors"}:
+            self._send_json({"doctors": db_helper.get_doctors()})
+            return
+        if parsed.path in {"/schedule", "/api/schedule"}:
+            params = parse_qs(parsed.query)
+            doctor = params.get("doctor", [""])[0]
+            week_start = params.get("week_start", [None])[0]
+            if not doctor:
+                self._send_json({"error": "doctor query param is required"}, status=400)
+                return
+            self._send_json(db_helper.get_week_schedule(doctor, week_start))
+            return
+        if parsed.path in {"/stats", "/api/stats"}:
+            self._send_json(db_helper.get_dashboard_stats())
+            return
+        if parsed.path in {"/slot-events", "/api/slot-events"}:
+            params = parse_qs(parsed.query)
+            try:
+                since = max(-1, int(params.get("since", ["0"])[0]))
+            except ValueError:
+                since = 0
+            self._send_json(db_helper.get_slot_events(since))
+            return
         if parsed.path in {"/logs", "/api/logs"}:
             params = parse_qs(parsed.query)
             raw_since = params.get("since", ["0"])[0]
@@ -146,9 +242,42 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self.send_error(404)
 
-    def _send_json(self, payload: dict) -> None:
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+            if not isinstance(body, dict):
+                raise ValueError("body must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._send_json({"error": f"invalid JSON body: {exc}"}, status=400)
+            return
+
+        if parsed.path in {"/doctors", "/api/doctors"}:
+            doctor, reason = db_helper.add_doctor(
+                str(body.get("name", "")), str(body.get("speciality", "") or "General")
+            )
+            if doctor is None:
+                self._send_json({"error": reason}, status=409 if reason == "already_exists" else 400)
+                return
+            self._send_json({"doctor": doctor}, status=201)
+            return
+
+        if parsed.path in {"/slots", "/api/slots"}:
+            ok, reason = db_helper.add_slot(
+                str(body.get("doctor", "")), str(body.get("date", "")), str(body.get("time", ""))
+            )
+            if not ok:
+                self._send_json({"error": reason}, status=409 if reason == "slot_exists" else 400)
+                return
+            self._send_json({"ok": True}, status=201)
+            return
+
+        self.send_error(404)
+
+    def _send_json(self, payload: dict, status: int = 200) -> None:
         data = json.dumps(payload).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()

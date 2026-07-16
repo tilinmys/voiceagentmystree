@@ -5,6 +5,352 @@ Companion docs: [CALL_FLOW.md](CALL_FLOW.md) (conversation wireframe), [LATENCY_
 
 ---
 
+## -10. 2026-07-16 — Adaptive VAD: context-aware end-of-utterance timing
+
+New `DynamicVADController` (agent.py), one instance per call: endpointing
+min_delay toggles per turn based on what the agent just asked - regex on the
+agent's own outgoing text, no models (Render memory limits).
+
+States: TRANSACTIONAL (min_delay = MIN_ENDPOINTING_DELAY, the tuned
+baseline - enabling this feature changes nothing for closed questions),
+HIGH_COGNITIVE_LOAD (`VAD_ENDPOINT_SLOW_S`=1.0 when the agent asked for a
+name, spelling, or an open "what brings you in" question), and
+FRAGMENT_RECOVERY (`VAD_ENDPOINT_FRAGMENT_S`=1.3, one-shot, when
+`looks_incomplete` catches a cut-off sentence - the passive fragment filter
+now actively extends the listen window instead of just staying silent).
+Perceived silence before commit ~= VAD silence (0.2s) + min_delay, so the
+totals land at ~0.55s fast / ~1.2s slow / ~1.5s fragment.
+
+**Two spec corrections found by verifying against the installed SDK before
+writing code:** (1) the naive target - mutating the Silero VAD's
+min_silence_duration - would have contaminated OTHER concurrent calls (the
+VAD instance is shared across sessions via proc.userdata); (2) no private
+attributes needed at all - `session.update_options(endpointing_opts=
+{"min_delay": ...})` is a public, documented API that merges per-key and
+propagates to the live activity (verified in agent_session.py source).
+
+Wiring (existing hook points only): tts_node's already-assembled full reply
+text; every deterministic fast-path/guardrail/FAQ reply; the cached-audio
+greeting evaluated explicitly (it bypasses tts_node and asks for the NAME -
+exactly the slow case); `on_user_turn_completed` consumes the one-shot
+fragment window. Every mode change logs a `vad_mode` pipeline event with
+state and threshold_ms (visible live in the frontend console).
+
+`VOICE_ADAPTIVE_VAD_ENABLED` (default true) - controller simply not
+attached when off; all behaviour identical to before. 20 new tests
+(tests/test_adaptive_vad.py): transitions, public-API call shape,
+idempotence, dead-session fail-safe, trigger coverage both directions, and
+full hook integration incl. fragment one-shot. Full regression: 218 tests
+across 5 suites.
+
+---
+
+## -9. 2026-07-16 — Layered safety guardrails (deterministic, both directions)
+
+Core principle: anything safety-critical is deterministic, not generated.
+New module [guardrails.py](guardrails.py) (regex-only, dependency-free),
+wired into existing hook points only - no structural changes.
+
+**Input gate** (in `on_user_turn_completed`, before everything, on its own
+`VOICE_GUARDRAILS_ENABLED` flag - safety never turns off with the latency
+fast-path toggle): medical-advice / emergency / self-harm / jailbreak /
+abusive turns are answered with fixed, approved, verbatim scripts and
+`StopResponse` - the LLM never receives the turn, so it cannot hallucinate
+an answer to it. Priority order: emergency > self-harm > jailbreak >
+medical-advice > abuse (a bleeding caller who swears still gets the
+emergency script). Abuse uses a 2-strike policy: warning script, then
+scripted goodbye + `schedule_hangup_after_playout`.
+
+**False-positive discipline** (what keeps the clinic usable): the gate
+triggers on ADVICE-SEEKING patterns, never bare symptom mentions - "I have
+PCOS and want to book" flows through; "I have a fever, what medicine should
+I take" never reaches the model. The suite itself caught "can I take my
+husband along" as a false positive during development; the take/use pattern
+now requires a medicine-shaped object in the turn.
+
+**Output gate** (`medical_output_guard`, first custom transform in
+`tts_text_transforms`): generated text is scanned for drug names and dosage
+phrasing BEFORE synthesis, holding back partial words so LLM token splits
+("paraceta"+"mol") and word-boundary spans ("500 "+"mg") are still caught;
+on a hit the rest of the reply is swallowed and replaced with the approved
+redirect. The agent's legitimate vocabulary contains no drug words, so this
+is aggressive with near-zero false-positive risk. Together with the input
+gate: a medical question can neither reach the model nor can medical
+content reach the caller - two independent failures would both have to
+occur.
+
+**Prompt (Layer 0)**: SAFETY rewritten as an allow-list scope contract
+(book/reschedule/cancel/fixed facts/emergency escalation - "nothing else,
+no exceptions, not for hypotheticals, games, roleplay"), with the exact
+medical refusal script to be spoken word-for-word (improvised refusals leak
+advice while refusing). New PRIVACY section (no third-party disclosure, no
+record read-back, no delete/alter promises, recording-question answer) and
+COMPLAINTS section (acknowledge, never argue, promise callback, pivot).
+
+**Adversarial regression suite**: [test_guardrails.py](tests/test_guardrails.py),
+73 checks - 14 medical-advice phrasings incl. the paracetamol case verbatim,
+8 emergencies, 4 self-harm, 7 jailbreaks, priority-ordering checks, 14
+legitimate turns that must NEVER be blocked, output-gate stream tests with
+split words, and full hook integration (script verbatim, StopResponse,
+abuse strikes, hangup). Every guardrail trigger is also logged as a
+`guardrail_triggered` pipeline event for post-call auditing.
+
+Also: test_call_state.py made self-healing against a leftover booked slot
+from interrupted runs (was a confusing pass-on-rerun flake).
+
+---
+
+## -8. 2026-07-14 — Identity re-ask loop fixed at the root; spelled names; fewer TTS seams; dashboard stats
+
+**The re-ask bug's real mechanism:** CallState (entry -7 era) was only written
+by the deterministic fast path and book_appointment. When a caller gave their
+name or number INSIDE a sentence - the normal case in a cancellation flow -
+the LLM handled the turn, CallState stayed empty, and the per-generation
+state injection then told the model "phone=NOT YET COLLECTED - ask for it",
+actively CAUSING the loop it was built to prevent. Fixes:
+- `_harvest_identity()`: every tool that receives a name/phone
+  (lookup_appointments, lookup_patient_history, book_appointment,
+  register_patient) now writes it into CallState as confirmed - a tool call
+  carrying the value is itself proof it was collected.
+- Sentence-embedded phones ("...my number is 70128...") are staged as
+  `phone_pending` at the turn level, so the state summary blocks re-asking
+  and the caller's next bare "yes" resolves deterministically.
+- cancel_appointment clears booking_confirmed/appointment_id when it cancels
+  the booking made in this same call.
+
+**Spelled names (deterministic):** new `assemble_spelled_name()` handles
+'P R I Y A', 'P, R, I, Y, A', 'P as in Papa...', and 'N double E T A' -
+previously a spelled sequence reached the LLM as fragment soup ("it's d a l
+a") and the model guessed. Aborts on any unexpected word so ordinary
+sentences can never be misread as spellings. Wired into the fast path when
+the agent just asked for the name or asked to spell it; reply adapts when
+the phone is already confirmed (cancel flows collect phone first).
+
+**Voice breaking:** the eager clause chunker cut EVERY clause into a separate
+TTS request; each seam between independently-synthesized chunks is an
+audible prosody break. Now adaptive: only the first chunk uses the small
+eager threshold (that one determines time-to-first-audio); later chunks wait
+for a larger buffer (`TTS_EAGER_REST_MIN_CHARS`, default 90) - same latency
+win, roughly half the seams per reply.
+
+**Cancel flow tightened:** prompt now mandates lookup_appointments before any
+cancel (never guess an ID), confirm-the-one when single, list-and-ask when
+multiple.
+
+**Dashboard stats:** `db_helper.get_dashboard_stats()` + `/stats` endpoint +
+stat-tile strip (booked/cancelled today, upcoming, open slots today, busiest
+doctor), polled every 10s and refreshed immediately on any slot event.
+
+125 tests pass (24 call-state incl. new harvest/spelling/sentence-phone
+cases, 73 fast-path incl. 10 new spelled-name cases, 28 schedule-db).
+Verified live: /stats serving, stat tiles rendering, zero console errors.
+
+---
+
+## -7. 2026-07-14 — Semantic FAQ cache (hours/location/fees/Sunday-closed)
+
+Intercepts a handful of static clinic FAQs before they reach the Groq LLM,
+using OpenAI `text-embedding-3-small` (256 dims) for semantic matching - not
+a local embedding model (same OOM concern that killed the multilingual turn
+detector on Render). New file [faq_cache.py](faq_cache.py).
+
+**Deviations from the literal spec, each with a reason:**
+- **No Redis.** ~15 short entries fit in a few KB of process memory; a
+  separate cache service is a new deployment dependency and failure mode for
+  something the existing `slot_cache`/greeting-cache pattern already
+  demonstrates doesn't need one.
+- **Not embedded on every turn.** A free local keyword pre-filter runs
+  first; the network embedding call only fires for turns that already share
+  vocabulary with a known FAQ topic. Embedding every turn (including the
+  majority that will never match) would add latency to the common case to
+  serve the uncommon one.
+- **Similarity threshold is 0.65, not 0.85.** Measured empirically (not
+  assumed): at 256 dimensions, an unambiguous true match ("do you guys even
+  open on sundays" → sunday_closed) scored 0.837 - the spec's 0.85 would
+  have silently rejected it. True hits clustered 0.70-0.84; the worst real
+  distractor topped out at 0.545. 0.65 sits in that gap with margin on both
+  sides, biased conservative since a false positive (misfiring a canned
+  answer over a real turn) is worse than a false negative (harmless
+  LLM fallback).
+- **No dynamic-query caching.** The spec's "1-minute TTL for dynamic
+  queries" is speculative future-proofing with no concrete dynamic query
+  defined yet - not built, per the standing rule against code for
+  hypothetical requirements.
+- **No doctor-list FAQ**, despite being an obvious candidate: the doctor
+  list stopped being purely static the moment the dashboard could add
+  doctors at runtime (`db_helper.add_doctor`, entry -6). A hardcoded cached
+  answer would go stale the instant someone adds a doctor from the UI.
+
+**Verified with real API calls, not assumptions:** 25/25 tests in
+[test_faq_cache.py](tests/test_faq_cache.py) - true-positive paraphrases not
+present in the trigger list, zero false positives across 11 realistic
+booking/symptom/confirmation turns, and response formatting checks (no SSML,
+no filler words). Directly unit-tested the actual
+`GracyAgent.on_user_turn_completed` integration point with a mocked session:
+confirmed it speaks the cached reply and raises `StopResponse` on a hit, and
+correctly falls through with neither on a miss. Confirmed live in the
+running worker: prewarm embeds all 30 trigger phrases in ~1.8s once at
+startup (not per-call).
+
+Env: `VOICE_FAQ_CACHE_ENABLED` (default true), `FAQ_CACHE_SIMILARITY_THRESHOLD`
+(default 0.65). Fails open on any error (missing key, API failure, not yet
+warmed) - falls through to the LLM exactly like a cache miss.
+
+---
+
+## -6. 2026-07-13 — Live clinic dashboard: doctor schedules, slot management, real-time booking feed
+
+Rebuilt the frontend into an operations dashboard and extended the DB/API
+layers underneath it. Verified end-to-end in the browser: a booking committed
+from a separate OS process appeared in the UI (cell colour change + feed
+entry) within one poll cycle (~1.5-4s), and its cancellation reverted the
+cell and logged a CANCELLED feed row.
+
+**db_helper.py**: new `doctors` table (seeded from the curated DOCTORS list;
+`add_doctor` with case-insensitive dedup) and append-only `slot_events` table
+written INSIDE the same transaction as every book/cancel/reschedule (a
+reschedule emits cancelled+booked pair). New: `add_slot` (08:00-19:30
+half-hour grid only, no past dates, no Sundays, no duplicates, doctor must
+exist), `get_week_schedule` (Mon-Fri grid with patient names via appointment
+join), `get_slot_events` (cursor feed; since=-1 tails last 15). 28 unit tests
+in tests/test_schedule_db.py incl. a true two-thread double-booking race
+(exactly one winner) and double-cancel rejection.
+
+**status_server.py**: GET /doctors /schedule /slot-events, POST /doctors
+/slots (with per-reason HTTP status codes). **Next.js**: proxy routes for
+each + full page.tsx rebuild - no marketing copy, just model/voice pickers,
+doctor dropdown with "+ New doctor", Mon-Fri slot table with per-day "+"
+slot-opening buttons, colour-coded cells (green open / rose booked with
+patient name / grey closed, flash animation on live changes), live
+booked/cancelled activity feed, and an always-on copyable full-width
+pipeline-log console at the bottom.
+
+---
+
+## -5. 2026-07-13 — Latency + correctness pass: EOU cut, name-capture fix, filler gating, goodbye playout
+
+Driven by live-call logs showing EOU p50 ~1.1s, an unsafe name capture, filler
+audio slower than the DB ops it covered, and goodbye audio racing the room
+disconnect. All changes are env-flagged and reversible.
+
+**1. EOU delay root cause and fix.** Logs showed `eou_delay` 1,059-1,152ms
+while the final transcript itself landed at 380-680ms - the missing ~600ms
+was `turn_detection="stt"` waiting for Deepgram's `speech_final` end-of-turn
+signal, which trails its final transcripts (verified in
+`livekit/agents/voice/audio_recognition.py`: without a semantic turn detector
+the endpointing sleep is just `min_delay`, so the wait was entirely the STT
+end-of-turn signal). Fix: `VOICE_TURN_DETECTION_MODE=vad` (new default) -
+commit at Silero end-of-speech once the final transcript is in. Expected EOU
+p50 ≈ max(VAD end + min_delay, transcript final) ≈ 450-700ms. `min_delay`
+default raised 0.05 → 0.35 because in vad mode it is the entire endpointing
+wait (0.05 would commit on the caller's first breath). Revert switch:
+`VOICE_TURN_DETECTION_MODE=stt`. The existing `looks_incomplete` fragment
+guard protects mid-sentence pauses from premature replies.
+
+**2. Reasoning-model empty replies (live bug, both models).**
+`openai/gpt-oss-20b` got no `reasoning_effort` control (only `qwen/` did),
+burned the whole 60-token budget on hidden reasoning, and returned
+`content:""` on every call. `build_llm()` now sets `reasoning_effort="none"`
+for qwen and `"low"` for gpt-oss models. Verified live: both return visible
+content. `.env` reverted to `qwen/qwen3-32b` @ 90 tokens (entry -4).
+
+**3. Unsafe name capture fixed.** "Hello? Are you there?" was captured as
+patient name "Hello Are You There" (live occurrence). `extract_spoken_name`
+now: rejects any text containing "?"; bare candidates (no "my name is..."
+introduction) limited to ≤2 words and screened against a conversational
+stopword list; final candidate must pass `is_valid_patient_name`. 13 new
+never-a-name regression tests + I am/I'm accept cases (57 pass).
+
+**4. Filler audio gated by a real threshold.** `say_progress` (spoke filler
+unconditionally, while DB ops finish in 7-15ms) replaced by `delayed_filler`:
+filler only plays if the tool is still running after
+`VOICE_FILLER_THRESHOLD_MS` (900), and is cancelled in a `finally` the moment
+the result is in. All 6 DB tools updated.
+
+**5. Goodbye cutoff fixed.** `end_call` deleted the room on a fixed 0.5s
+timer, racing the LLM's post-tool goodbye line. The hangup task now waits
+(bounded by `END_CALL_MAX_WAIT_SECONDS=8`) until `session.current_speech` is
+clear before deleting the room.
+
+**6. Smaller fixes.** Tool-only LLM completions are now logged as
+"Tool-only LLM completion" (ok) instead of "Empty LLM completion" (warn) -
+the fallback logic already treated them correctly; the label lied. Line-live
+check phrase shortened to "Are you still there?" (env-overridable).
+
+**Deliberately NOT done, and why:** per-turn state-aware endpointing
+(framework sets EndpointingOptions once per session; private-API mutation is
+not production-safe), a custom single-turn orchestrator (LiveKit's
+AgentActivity already owns one generation per speech_id; preemptive
+generation intentionally re-generates when the final transcript changes and
+cancels the loser), prompt-history truncation (risk of losing booking state
+mid-call outweighs token savings at current volumes), and TTS chunk-count
+capping (chunking follows LLM sentence flow; Smallest.ai TTFA is already
+210-370ms per segment).
+
+---
+
+## -4. 2026-07-13 — Re-verified 8B-vs-32B and "lazy fallback init"; fixed a live empty-reply bug
+
+A pasted video-based analysis suggested two changes: (1) downsize the primary
+LLM to an 8B model for lower TTFT, (2) lazily construct STT/LLM fallback
+providers (Deepgram, OpenAI, Sarvam/Rumik/Gemini) so they're only built when
+the primary fails. Both were tested empirically before touching anything.
+
+**1. Model size vs speed, re-run with more data points.** Added
+`groq/allam-2-7b` (smallest model on Groq) and the model actually configured
+in production, `groq/openai-gpt-oss-20b`, to the benchmark (8 runs each, real
+clinic prompt):
+
+| Model | TTFT p50 | Success rate |
+|---|---|---|
+| groq/allam-2-7b (smallest, 7B) | 190ms | 4/8 (rate-limited) |
+| groq/qwen3-32b | 196ms | 8/8 |
+| groq/llama-3.1-8b-instant | 236ms | 7/8 |
+| openai/gpt-4o-mini | 954ms | 8/8 |
+| gemini-2.5-flash | 1599ms | 7/8 (quota) |
+
+The 7B model is not meaningfully faster than the 32B model (6ms apart, within
+noise) and fails under load far more often — Groq's LPU inference time is
+dominated by fixed overhead, not parameter count, at this scale. **Verdict:
+keep `qwen/qwen3-32b` primary.** The video's "smaller = faster" heuristic
+does not hold on this hardware for this workload.
+
+**2. Lazy fallback initialization — not implemented, and why.**
+`livekit-agents`' `stt.FallbackAdapter`/`llm.FallbackAdapter` require a
+pre-built `list[STT]`/`list[LLM]` in their constructor (confirmed via
+`inspect.signature`) — there is no factory/callable support to defer
+construction. Measured actual construction cost directly:
+
+| Provider chain | Construction time |
+|---|---|
+| `build_stt()` (AssemblyAI + Deepgram fallback) | ~2ms |
+| `build_llm()` (2x Groq key + OpenAI fallback) | ~20-36ms |
+| `build_tts()` (single provider, no fallback chain) | ~0.1ms |
+
+All three are called exactly once per call, in `entrypoint()`, overlapped
+with the async `preload_user()` task — not in the per-turn hot path. Even the
+worst case (~36ms, once, before the caller is connected) is immaterial next
+to per-turn LLM TTFT (~200-1000ms). Building a custom lazy-wrapper to work
+around `FallbackAdapter`'s API would add real complexity for zero measurable
+latency benefit. **Not implemented.**
+
+**3. Bug found while re-testing: `GROQ_LLM_MODEL` had drifted to
+`openai/gpt-oss-20b` in `.env`** (a reasoning model) with
+`LLM_MAX_COMPLETION_TOKENS=60`. GPT-OSS models spend their completion-token
+budget on a hidden `reasoning` field first; with a 60-token budget it
+exhausted the budget mid-thought and returned `content: ""` on **every**
+call — confirmed via a raw non-streaming request showing
+`"content": "", "reasoning": "...", "finish_reason": "length"`. This means
+production was silently answering callers with empty replies until this
+session's re-verification caught it. Reverted `GROQ_LLM_MODEL` to
+`qwen/qwen3-32b` and `LLM_MAX_COMPLETION_TOKENS` back to `90`
+(`LLM_TEMPERATURE` back to `0.25`), matching the values from entry -3 below.
+If `.env` LLM values look wrong again, check `git diff` / recent manual
+edits before assuming the code is at fault — this file is hand-edited
+outside of code changes and nothing validates it at startup.
+
+---
+
 ## -3. 2026-07-13 — LLM speed comparison, Groq qwen3-32b promoted to primary
 
 Compared `openai/gpt-4o-mini` (was primary), `groq/llama-3.1-8b-instant` (was

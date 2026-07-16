@@ -18,9 +18,8 @@
 
 html,
 body {
-  width: 100vw;
-  height: 100vh;
-  overflow: hidden;
+  width: 100%;
+  min-height: 100vh;
   color: var(--foreground);
   background-color: var(--background);
   font-family: var(--font-geist-sans), -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
@@ -28,9 +27,11 @@ body {
 }
 
 body {
-  display: flex;
-  justify-content: center;
-  align-items: center;
+  /* The dashboard is taller than most viewports (doctor schedule table +
+     live feed + logs console) - the page must scroll normally. This used to
+     be height:100vh + overflow:hidden + flex-centered for a single small
+     lobby card; with real dashboard content that clipped everything below
+     the fold with no way to reach it at all. */
   position: relative;
 }
 

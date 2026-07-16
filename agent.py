@@ -245,6 +245,9 @@ from livekit.agents import (
     tts,
 )
 from livekit.agents.voice.agent_session import SessionConnectOptions
+from livekit.agents.tokenize.tokenizer import SentenceStream, SentenceTokenizer, TokenData
+from livekit.agents import utils
+from livekit.agents.utils import shortuuid
 from livekit.plugins import assemblyai, deepgram, noise_cancellation, openai, silero
 
 # Cartesia is deliberately removed from the runtime TTS chain. Direct probing returned HTTP 402 Payment Required; re-add after billing fixed.
@@ -266,6 +269,8 @@ from sarvam_wrappers import SarvamSTT, SarvamTTS
 from smallest_wrappers import SmallestTTS
 from rumik_wrappers import RumikTTS
 from gemini_wrappers import GeminiTTS
+import faq_cache
+import guardrails
 from voice_catalog import (
     CATALOG as VOICE_CATALOG,
     PROVIDERS as TTS_PROVIDERS,
@@ -324,6 +329,34 @@ CLINIC_KEY_TERMS = [
     "OPD",
 ]
 
+# Common Indian first names biased into the STT vocabulary via Deepgram/
+# AssemblyAI keyterm prompting, so a caller's own name isn't mis-heard as the
+# nearest English word the model already knows (observed live: "Ayesha" or
+# similar transcribed as "idea", repeatedly, across an entire call). This is
+# a bias list, not a whitelist - any name is still accepted; unlisted names
+# just don't get the extra recognition weight. Deliberately broad across
+# regions/genders for a Bengaluru clinic's real caller mix; add more if a
+# name is consistently mis-heard rather than assuming this list is complete.
+COMMON_INDIAN_NAMES = [
+    "Priya", "Pooja", "Divya", "Ayesha", "Aisha", "Ananya", "Anjali", "Anita",
+    "Sunita", "Kavya", "Kavitha", "Shreya", "Shruti", "Neha", "Meera", "Deepa",
+    "Deepti", "Ritu", "Rupa", "Rupali", "Suhani", "Sneha", "Swathi", "Chaitra",
+    "Nivetha", "Nithya", "Lakshmi", "Latha", "Radha", "Rekha", "Sowmya",
+    "Vidya", "Vandana", "Kiran", "Komal", "Farida", "Fatima", "Zainab",
+    "Sana", "Sania", "Reshma", "Asha", "Usha", "Geetha", "Gayathri",
+    "Tanvi", "Tanya", "Ishita", "Isha", "Jyothi", "Manasa", "Manisha",
+    "Preethi", "Preeti", "Rachana", "Roopa", "Sindhu", "Soundarya",
+    "Amit", "Arjun", "Rahul", "Rohan", "Rohit", "Vinayak", "Vijay", "Vikram",
+    "Vishal", "Karthik", "Kumar", "Suresh", "Ramesh", "Ganesh",
+    "Ganapathi", "Mahesh", "Naveen", "Nagesh", "Praveen", "Prakash", "Pradeep",
+    "Sandeep", "Sanjay", "Santosh", "Manoj", "Manjunath", "Mohan", "Mohammed",
+    "Imran", "Irfan", "Faisal", "Farhan", "Ashwin", "Ashok", "Anand", "Anil",
+    "Ajay", "Akash", "Abhishek", "Aditya", "Deepak", "Dinesh", "Gopal",
+    "Girish", "Harish", "Jagadish", "Krishna", "Lokesh", "Nithin", "Raghav",
+    "Raj", "Rajesh", "Ravi", "Ravindra", "Sathish", "Shankar", "Srinivas",
+    "Tarun", "Umesh", "Venkatesh", "Yogesh", "Zaid",
+]
+
 
 def env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -333,7 +366,7 @@ def env_flag(name: str, default: bool = False) -> bool:
 
 
 GREETING_TEXT = (
-    "Namaste, thank you for calling MyStree Clinic... This is Gracy. "
+    "Thank you for calling MyStree Clinic... This is Gracy. "
     "May I please have your name?"
 )
 GREETING_CACHE_DIR = Path(os.getenv("GREETING_CACHE_DIR", "assets/audio/greetings"))
@@ -508,6 +541,54 @@ async def filter_code_artifacts(text):
 
     if pending_brace:
         yield "{"
+
+
+async def medical_output_guard(text):
+    """TTS guard: drug names and dosage phrasing must never be SPOKEN, even
+    if the LLM generates them (a jailbreak that survived the input gate, or
+    unprompted volunteering). The agent's legitimate vocabulary contains no
+    drug or dosage words at all, so this can be aggressive.
+
+    Streams with a held-back partial word: LLM token deltas can split words
+    mid-stream ("paraceta" + "mol"), so only whitespace-complete text is
+    scanned and emitted, with a short emitted-tail window for patterns that
+    span a word boundary ("500 " then "mg"). On a hit, the rest of this
+    reply is swallowed and replaced with the approved redirect - the drug
+    name never reaches the synthesizer.
+    """
+    buffer = ""
+    tail = ""  # last emitted chars, for cross-chunk pattern context
+    flagged = False
+    async for chunk in text:
+        if flagged:
+            continue  # swallow the remainder of a flagged reply
+        buffer += chunk
+        cut = max(buffer.rfind(" "), buffer.rfind("\n"))
+        if cut == -1:
+            continue  # nothing whitespace-complete yet - keep holding
+        emit, buffer = buffer[: cut + 1], buffer[cut + 1:]
+        if guardrails.output_flagged(tail + emit):
+            flagged = True
+            pipeline_event(
+                "tts", "warn", "Guardrail: medical content blocked at output",
+                "Generated text contained drug/dosage phrasing; replaced before TTS",
+                event="guardrail_output_blocked",
+            )
+            yield guardrails.OUTPUT_REPLACEMENT
+            buffer = ""
+            continue
+        yield emit
+        tail = (tail + emit)[-48:]
+    if not flagged and buffer:
+        if guardrails.output_flagged(tail + buffer):
+            pipeline_event(
+                "tts", "warn", "Guardrail: medical content blocked at output",
+                "Generated text contained drug/dosage phrasing; replaced before TTS",
+                event="guardrail_output_blocked",
+            )
+            yield guardrails.OUTPUT_REPLACEMENT
+        else:
+            yield buffer
 
 
 _TIME_RE = re.compile(r"(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?", re.IGNORECASE)
@@ -1322,20 +1403,40 @@ def force_bulbul_v3() -> str:
     return "bulbul:v3"
 
 
-async def say_progress(ctx: RunContext, text: str | None = None) -> None:
-    phrase = text or _choose_filler_text()
-    pipeline_event("tts", "info", "Filler audio", phrase, event="filler_audio_queued", non_blocking=True)
+class _FillerHandle:
+    """Cancellable handle for a scheduled filler phrase."""
 
-    async def _speak_filler() -> None:
+    def __init__(self, task: asyncio.Task) -> None:
+        self._task = task
+
+    def cancel(self) -> None:
+        if not self._task.done():
+            self._task.cancel()
+
+
+def delayed_filler(ctx: RunContext, text: str | None = None) -> _FillerHandle:
+    """Speak a filler phrase ONLY if the surrounding operation is still running
+    after VOICE_FILLER_THRESHOLD_MS. DB tools routinely finish in 7-15ms; the
+    old unconditional filler ('Sure, one second... pulling that up now.') took
+    far longer to say than the lookup it was covering for, and could overlap
+    the real answer. Callers cancel() the handle as soon as the result is in.
+    """
+    threshold_s = float(os.getenv("VOICE_FILLER_THRESHOLD_MS", "900")) / 1000.0
+
+    async def _speak_filler_if_still_waiting() -> None:
+        await asyncio.sleep(threshold_s)
+        phrase = text or _choose_filler_text()
+        pipeline_event(
+            "tts", "info", "Filler audio (slow operation)", phrase,
+            event="filler_audio_queued", threshold_ms=round(threshold_s * 1000),
+        )
         try:
             await ctx.session.say(phrase, allow_interruptions=True)
-            pipeline_event("tts", "ok", "Filler queued", phrase, non_blocking=True)
         except Exception:
             pipeline_event("tts", "warn", "Filler failed", phrase, traceback=traceback.format_exc())
             logger.warning("Unable to say progress phrase: %s", phrase, exc_info=True)
 
-    asyncio.create_task(_speak_filler())
-    await asyncio.sleep(0)
+    return _FillerHandle(asyncio.create_task(_speak_filler_if_still_waiting()))
 
 
 async def run_db_step(tool_name: str, operation: str, fn, *args):
@@ -1378,6 +1479,38 @@ def log_tool_failure(tool_name: str, exc: Exception) -> None:
     logger.error("Tool %s failed:\n%s", tool_name, traceback.format_exc())
 
 
+def _harvest_identity(ctx: RunContext, name: str | None = None, phone: str | None = None) -> None:
+    """Record name/phone into CallState whenever the LLM passes them to a tool.
+
+    The fast path only captures identity from bare, unambiguous turns ("My
+    name is Priya" as its own utterance). When the caller gives their name or
+    number INSIDE a sentence - the normal case in a cancellation flow ("I
+    want to cancel, my number is 70128...") - the LLM handles the turn and,
+    before this helper existed, CallState stayed empty. The per-generation
+    state injection then told the model "phone=NOT YET COLLECTED - ask for
+    it", actively CAUSING the re-ask loop it was built to prevent. A tool
+    call carrying a phone/name is itself proof the value was collected - the
+    model already committed to it - so it is the correct capture point, and
+    marking it confirmed here means the state summary stops instructing the
+    model to ask again.
+    """
+    try:
+        state: CallState = ctx.userdata
+    except Exception:
+        return
+    if state is None:
+        return
+    if name and is_valid_patient_name(name) and not state.name_confirmed:
+        state.name = clean_patient_name(name)
+        state.name_confirmed = True
+    if phone and not state.phone_confirmed:
+        candidate = extract_phone_candidate(phone)
+        if candidate:
+            state.phone = "-".join(re.sub(r"\D", "", db_helper.normalize_phone(candidate))[-10:])
+            state.phone_confirmed = True
+            state.phone_pending = None
+
+
 @llm.function_tool
 async def lookup_doctors(ctx: RunContext) -> str:
     """Lists all available doctors at MyStree Clinic along with their specialities."""
@@ -1404,6 +1537,8 @@ _SUNDAY_MESSAGE = (
 async def find_slots(ctx: RunContext, doctor_name: str, date: str, preferred_time: str) -> str:
     """Checks if a doctor's slot is free at the caller's preferred date (YYYY-MM-DD) and time,
     and if that slot is taken, returns the nearest available alternatives. Instant, no waiting."""
+    if doctor_name:
+        doctor_name = db_helper.fuzzy_match_doctor(doctor_name) or doctor_name
     if not db_helper.is_clinic_open(date):
         return _SUNDAY_MESSAGE
     slot_time = parse_time_to_24h(preferred_time)
@@ -1433,6 +1568,8 @@ async def find_slots(ctx: RunContext, doctor_name: str, date: str, preferred_tim
 async def fastest_appointment(ctx: RunContext, doctor_name: str = "") -> str:
     """Finds the very earliest available appointment, for callers in a hurry.
     Optionally limited to one doctor. Instant, no waiting."""
+    if doctor_name:
+        doctor_name = db_helper.fuzzy_match_doctor(doctor_name) or doctor_name
     slots = slot_cache.earliest(doctor_name or None, k=3)
     if not slots:
         return "No open slots at all this week. Apologise and offer a callback."
@@ -1447,6 +1584,8 @@ async def fastest_appointment(ctx: RunContext, doctor_name: str = "") -> str:
 @llm.function_tool
 async def lookup_booking_timings(ctx: RunContext, doctor_name: str, date: str) -> str:
     """Lists available appointment timings for a doctor on a date in YYYY-MM-DD format. Instant, no waiting."""
+    if doctor_name:
+        doctor_name = db_helper.fuzzy_match_doctor(doctor_name) or doctor_name
     if not db_helper.is_clinic_open(date):
         return _SUNDAY_MESSAGE
     day_slots = sorted(
@@ -1459,8 +1598,8 @@ async def lookup_booking_timings(ctx: RunContext, doctor_name: str, date: str) -
         options = "; ".join(_slot_phrase(s) for s in nearest)
         return f"{doctor_name} is fully booked on {friendly_date(date)}. Nearest available: {options}."
 
-    morning = [short_time(t) for t in day_slots if t < "13:00"][:3]
-    evening = [short_time(t) for t in day_slots if t >= "13:00"][:3]
+    morning = [short_time(t) for t in day_slots if t < "13:00"]
+    evening = [short_time(t) for t in day_slots if t >= "13:00"]
     parts = []
     if morning:
         parts.append("in the morning " + ", ".join(morning))
@@ -1468,15 +1607,15 @@ async def lookup_booking_timings(ctx: RunContext, doctor_name: str, date: str) -
         parts.append("in the evening " + ", ".join(evening))
     return (
         f"Free with {doctor_name} on {friendly_date(date)}: " + "; ".join(parts) + ". "
-        "Offer the caller at most two or three of these in one warm sentence, then ask which one works."
+        "Offer the caller ALL of these slots to choose from, do not truncate."
     )
 
 
 @llm.function_tool
 async def lookup_appointments(ctx: RunContext, phone: str) -> str:
     """Looks up scheduled clinic appointments by phone number. Use only when phone is already known."""
-    await say_progress(ctx)
-
+    _harvest_identity(ctx, phone=phone)
+    filler = delayed_filler(ctx)
     try:
         warmed = await booking_prefetch.get_phone(phone)
         patient = warmed["patient"]
@@ -1496,6 +1635,8 @@ async def lookup_appointments(ctx: RunContext, phone: str) -> str:
     except Exception as exc:
         log_tool_failure("lookup_appointments", exc)
         raise llm.ToolError("Something went wrong on our side while looking that up. Apologise and ask the caller to repeat the number.")
+    finally:
+        filler.cancel()
 
 @llm.function_tool
 async def lookup_patient_history(ctx: RunContext, name: str, phone: str = "") -> str:
@@ -1504,9 +1645,9 @@ async def lookup_patient_history(ctx: RunContext, name: str, phone: str = "") ->
     if not is_valid_patient_name(name):
         return invalid_name_retry_message(name)
     name = clean_patient_name(name)
+    _harvest_identity(ctx, name=name, phone=phone or None)
     profile = log_caller_profile(name)
-    await say_progress(ctx)
-
+    filler = delayed_filler(ctx)
     try:
         patients = await run_db_step(
             "lookup_patient_history",
@@ -1542,21 +1683,25 @@ async def lookup_patient_history(ctx: RunContext, name: str, phone: str = "") ->
     except Exception as exc:
         log_tool_failure("lookup_patient_history", exc)
         raise llm.ToolError("Something went wrong while checking the old visit. Apologise and continue with a fresh booking.")
+    finally:
+        filler.cancel()
 
 
 @llm.function_tool
 async def book_appointment(ctx: RunContext, name: str, phone: str, doctor_name: str, date: str, time: str) -> str:
     """Books an appointment using caller name, phone, doctor name, date in YYYY-MM-DD format, and time.
     Creates a lightweight patient record automatically when the phone is new; never ask DOB."""
+    if doctor_name:
+        doctor_name = db_helper.fuzzy_match_doctor(doctor_name) or doctor_name
     if not db_helper.is_clinic_open(date):
         return _SUNDAY_MESSAGE
     if not is_valid_patient_name(name):
         return invalid_name_retry_message(name)
     name = clean_patient_name(name)
+    _harvest_identity(ctx, name=name, phone=phone)
     profile = log_caller_profile(name)
 
-    await say_progress(ctx)
-
+    filler = delayed_filler(ctx)
     slot_time = parse_time_to_24h(time) or time
     try:
         patient = await run_db_step(
@@ -1586,6 +1731,13 @@ async def book_appointment(ctx: RunContext, name: str, phone: str, doctor_name: 
                 slot_cache.refresh_soon("post-booking")
             else:
                 await slot_cache.refresh()
+            try:
+                state: CallState = ctx.userdata
+                state.doctor = doctor_name
+                state.booking_confirmed = True
+                state.appointment_id = appointment_id
+            except Exception:
+                pass  # no userdata on this session - booking already succeeded regardless
             return (
                 f"Booked. Appointment ID {appointment_id} with {doctor_name} "
                 f"on {friendly_date(date)} at {friendly_time(slot_time)}. "
@@ -1616,6 +1768,8 @@ async def book_appointment(ctx: RunContext, name: str, phone: str, doctor_name: 
     except Exception as exc:
         log_tool_failure("book_appointment", exc)
         raise llm.ToolError("Something went wrong on our side while booking. Apologise and try once more.")
+    finally:
+        filler.cancel()
 
 @llm.function_tool
 async def reschedule_appointment(ctx: RunContext, appointment_id: int, new_date: str, new_time: str) -> str:
@@ -1625,8 +1779,7 @@ async def reschedule_appointment(ctx: RunContext, appointment_id: int, new_date:
     if not db_helper.is_clinic_open(new_date):
         return _SUNDAY_MESSAGE
 
-    await say_progress(ctx)
-
+    filler = delayed_filler(ctx)
     slot_time = parse_time_to_24h(new_time) or new_time
     try:
         ok, reason = await run_db_step(
@@ -1661,14 +1814,15 @@ async def reschedule_appointment(ctx: RunContext, appointment_id: int, new_date:
     except Exception as exc:
         log_tool_failure("reschedule_appointment", exc)
         raise llm.ToolError("Something went wrong on our side while changing the time. The original booking is safe. Apologise and try once more.")
+    finally:
+        filler.cancel()
 
 
 @llm.function_tool
 async def cancel_appointment(ctx: RunContext, appointment_id: int, reason: str = "") -> str:
     """Cancels a scheduled appointment by its ID and frees the slot. Pass the caller's
     cancellation reason if the caller chose to share one; leave it empty otherwise."""
-    await say_progress(ctx)
-
+    filler = delayed_filler(ctx)
     try:
         success = await run_db_step(
             "cancel_appointment",
@@ -1684,17 +1838,26 @@ async def cancel_appointment(ctx: RunContext, appointment_id: int, reason: str =
         else:
             await slot_cache.refresh()
         if success:
+            try:
+                state: CallState = ctx.userdata
+                if state is not None and state.appointment_id == appointment_id:
+                    state.booking_confirmed = False
+                    state.appointment_id = None
+            except Exception:
+                pass
             return f"Appointment {appointment_id} has been cancelled and the slot is free again."
         return f"Appointment ID {appointment_id} was not found or is already cancelled."
     except Exception as exc:
         log_tool_failure("cancel_appointment", exc)
         raise llm.ToolError("Something went wrong on our side while cancelling. Apologise and try once more.")
+    finally:
+        filler.cancel()
 
 @llm.function_tool
 async def register_patient(ctx: RunContext, name: str, phone: str, dob: str) -> str:
     """Registers a new patient with full name, phone number, and DOB in YYYY-MM-DD format."""
-    await say_progress(ctx)
-
+    _harvest_identity(ctx, name=name, phone=phone)
+    filler = delayed_filler(ctx)
     try:
         await run_db_step(
             "register_patient",
@@ -1712,7 +1875,48 @@ async def register_patient(ctx: RunContext, name: str, phone: str, dob: str) -> 
             return "A patient with this phone number is already registered. Proceed with booking."
         log_tool_failure("register_patient", exc)
         raise llm.ToolError("Something went wrong on our side while registering. Apologise and try once more.")
+    finally:
+        filler.cancel()
 
+
+@llm.function_tool
+def schedule_hangup_after_playout(session) -> None:
+    """Delete the room once the session has finished speaking everything
+    queued. Shared by end_call (LLM-initiated), the deterministic goodbye
+    fast path, and the silence auto-close - one hangup behaviour everywhere.
+
+    Waiting on current_speech instead of a fixed timer matters: the LLM
+    often produces one more spoken line after end_call returns (the
+    tool-result continuation), and a fixed 0.5s delay raced that final line
+    and cut the goodbye off mid-word. Bounded so a stuck TTS can never keep
+    a dead call open.
+    """
+
+    async def _hangup() -> None:
+        deadline = time.monotonic() + float(os.getenv("END_CALL_MAX_WAIT_SECONDS", "8.0"))
+        await asyncio.sleep(0.3)  # let any continuation speech get scheduled
+        while time.monotonic() < deadline:
+            speech = session.current_speech
+            if speech is None:
+                break
+            try:
+                await speech.wait_for_playout()
+            except Exception:
+                pass
+            await asyncio.sleep(0.15)
+        await asyncio.sleep(0.3)  # small safety margin after final playout
+        try:
+            from livekit.agents import get_job_context
+            await get_job_context().delete_room()
+            pipeline_event("worker", "ok", "Call ended", "Room deleted after goodbye finished playing")
+        except Exception as exc:
+            pipeline_event("worker", "warn", "Room deletion failed", str(exc))
+        try:
+            await getattr(session, "room").disconnect()
+        except Exception as exc:
+            pipeline_event("worker", "warn", "Room disconnect failed", str(exc))
+
+    asyncio.create_task(_hangup())
 
 @llm.function_tool
 async def end_call(ctx: RunContext) -> str:
@@ -1723,18 +1927,7 @@ async def end_call(ctx: RunContext) -> str:
         await ctx.wait_for_playout()  # let the goodbye finish playing first
     except Exception:
         pass
-
-    async def _hangup() -> None:
-        await asyncio.sleep(0.5)
-        try:
-            from livekit.agents import get_job_context
-
-            await get_job_context().delete_room()
-            pipeline_event("worker", "ok", "Call ended", "Room deleted after goodbye")
-        except Exception as exc:
-            pipeline_event("worker", "warn", "Hangup failed", str(exc))
-
-    asyncio.create_task(_hangup())
+    schedule_hangup_after_playout(ctx.session)
     return "The call is ending now. Do not say anything more."
 
 
@@ -1827,7 +2020,22 @@ class LockedSpeechStream(assemblyai.SpeechStream):
             self._opts.speech_model,
             self._base_url,
         )
-        ws = await self._session.ws_connect(url, headers=headers)
+        try:
+            ws = await self._session.ws_connect(url, headers=headers)
+        except Exception as exc:
+            logger.exception(
+                "AssemblyAI stream failed provider=assemblyai model=%s error_type=%s error=%s",
+                self._opts.speech_model,
+                type(exc).__name__,
+                str(exc),
+            )
+            pipeline_event(
+                "stt", "error", "AssemblyAI stream failed",
+                "AssemblyAI connection failed; STT fallback will be used",
+                provider="assemblyai", model=self._opts.speech_model,
+                error_type=type(exc).__name__, error=str(exc),
+            )
+            raise
         logger.debug(
             "AssemblyAI WebSocket connected status=%s",
             ws._response.status if ws._response is not None else None,
@@ -1855,8 +2063,8 @@ class LockedAssemblyAISTT(assemblyai.STT):
         return stream
 
 
-def build_stt() -> stt.STT:
-    """Primary AssemblyAI Universal 3 Pro with Deepgram fallback.
+def build_stt(min_turn_silence: int = 90, max_turn_silence: int = 320, interruption_delay: int = 120) -> stt.STT:
+    """Configurable Deepgram/AssemblyAI streaming fallback chain.
 
     AssemblyAI can occasionally close a streaming socket with status 3006.
     That failure is retryable at the provider level, but if the raw STT is
@@ -1864,16 +2072,20 @@ def build_stt() -> stt.STT:
     Keep AssemblyAI as the high-accuracy path and wrap it with Deepgram so the
     call stays alive during transient AssemblyAI stream failures.
     """
+    # Name bias list is additive to STT_KEY_TERMS/CLINIC_KEY_TERMS (never
+    # replaces a custom override) so clinic/doctor terms and common caller
+    # first names both get recognition weight, not one at the expense of the
+    # other. Env-gated so it can be disabled without a code change if it
+    # ever crowds out something more important for a given deployment.
     key_terms = env_list("STT_KEY_TERMS", CLINIC_KEY_TERMS)
+    if env_flag("STT_BIAS_COMMON_NAMES", True):
+        key_terms = key_terms + [n for n in COMMON_INDIAN_NAMES if n not in key_terms]
 
-    min_turn_silence = max(60, min(int(os.getenv("ASSEMBLYAI_MIN_TURN_SILENCE", "90")), 180))
-    max_turn_silence = max(180, min(int(os.getenv("ASSEMBLYAI_MAX_TURN_SILENCE", "320")), 500))
-    interruption_delay = max(80, min(int(os.getenv("ASSEMBLYAI_INTERRUPTION_DELAY", "120")), 250))
     primary = LockedAssemblyAISTT(
         api_key=required_env("ASSEMBLYAI_API_KEY"),
         model=os.getenv("ASSEMBLYAI_STT_MODEL", "universal-3-5-pro"),
         language_detection=env_flag("ASSEMBLYAI_LANGUAGE_DETECTION", False),
-        keyterms_prompt=key_terms,
+        keyterms_prompt=key_terms[:100],
         prompt=os.getenv(
             "ASSEMBLYAI_TRANSCRIPT_PROMPT",
             "Transcribe MyStree Clinic callers in clear Latin script. "
@@ -1886,7 +2098,12 @@ def build_stt() -> stt.STT:
         min_turn_silence=min_turn_silence,
         max_turn_silence=max_turn_silence,
         interruption_delay=interruption_delay,
-        mode=os.getenv("ASSEMBLYAI_MODE", "min_latency"),
+        # With STT_PRIMARY=deepgram (the current default), AssemblyAI here is
+        # the FALLBACK, only invoked when Deepgram is unavailable - trading a
+        # little speed for better accuracy costs nothing on a normal call in
+        # that configuration. If STT_PRIMARY is flipped to assemblyai, this
+        # mode applies to every turn instead - reconsider then.
+        mode=os.getenv("ASSEMBLYAI_MODE", "balanced"),
     )
 
     deepgram_key = os.getenv("DEEPGRAM_API_KEY")
@@ -1912,11 +2129,20 @@ def build_stt() -> stt.STT:
         no_delay=True,
         endpointing_ms=max(10, min(int(os.getenv("DEEPGRAM_ENDPOINTING_MS", "80")), 300)),
         filler_words=True,
-        keyterm=key_terms[:50],
+        # Raised from 50: adding the common-name bias list means clinic
+        # terms alone (~32) plus common names (~120) exceeds Deepgram's
+        # practical keyterm budget. Clinic/doctor terms are listed first in
+        # key_terms, so this slice keeps all of them and fills the rest with
+        # names - truncation never silently drops a doctor's name.
+        keyterm=key_terms[:100],
     )
 
+    deepgram_first = os.getenv("STT_PRIMARY", "deepgram").strip().lower() == "deepgram"
+    ordered_providers = [fallback, primary] if deepgram_first else [primary, fallback]
+    primary_label = "Deepgram Nova-3" if deepgram_first else "AssemblyAI Universal 3 Pro"
+    fallback_label = "AssemblyAI Universal 3 Pro" if deepgram_first else "Deepgram Nova-3"
     adapter = stt.FallbackAdapter(
-        [primary, fallback],
+        ordered_providers,
         attempt_timeout=float(os.getenv("STT_FALLBACK_ATTEMPT_TIMEOUT", "4.0")),
         max_retry_per_stt=int(os.getenv("STT_FALLBACK_MAX_RETRY_PER_PROVIDER", "1")),
         retry_interval=float(os.getenv("STT_FALLBACK_RETRY_INTERVAL", "0.35")),
@@ -1940,9 +2166,11 @@ def build_stt() -> stt.STT:
         "stt",
         "info",
         "STT fallback chain configured",
-        "AssemblyAI Universal 3 Pro primary; Deepgram fallback catches retryable stream closures",
-        primary_model=os.getenv("ASSEMBLYAI_STT_MODEL", "universal-3-5-pro"),
-        fallback_model=deepgram_model,
+        f"{primary_label} primary; {fallback_label} fallback",
+        primary_provider="deepgram" if deepgram_first else "assemblyai",
+        fallback_provider="assemblyai" if deepgram_first else "deepgram",
+        primary_model=deepgram_model if deepgram_first else os.getenv("ASSEMBLYAI_STT_MODEL", "universal-3-5-pro"),
+        fallback_model=os.getenv("ASSEMBLYAI_STT_MODEL", "universal-3-5-pro") if deepgram_first else deepgram_model,
         min_turn_silence=min_turn_silence,
         max_turn_silence=max_turn_silence,
         interruption_delay=interruption_delay,
@@ -1954,7 +2182,7 @@ def build_stt() -> stt.STT:
     return adapter
 
 
-def build_llm() -> llm.LLM:
+def build_llm(temperature: float = 0.3) -> llm.LLM:
     """Production-safe LLM fallback chain.
 
     Groq can be very fast on raw requests, but the on-demand tier has a low
@@ -1965,7 +2193,10 @@ def build_llm() -> llm.LLM:
     providers: list[llm.LLM] = []
     groq_providers: list[llm.LLM] = []
     groq_keys = groq_api_keys()
-    groq_model = os.getenv("GROQ_LLM_MODEL", "llama-3.1-8b-instant")
+    # Qwen 3 can spend the complete voice-token budget on hidden reasoning and
+    # finish with no assistant content. Prefer a fast non-reasoning model for
+    # spoken turns; callers should never experience a successful-but-silent LLM.
+    groq_model = os.getenv("GROQ_LLM_MODEL", "openai/gpt-oss-20b")
     groq_base_url = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
     for index, groq_key in enumerate(groq_keys, start=1):
         groq_providers.append(
@@ -1973,8 +2204,21 @@ def build_llm() -> llm.LLM:
                 model=groq_model,
                 api_key=groq_key,
                 base_url=groq_base_url,
-                max_completion_tokens=int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "90")),
-                temperature=float(os.getenv("LLM_TEMPERATURE", "0.25")),
+                max_completion_tokens=int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "60")),
+                temperature=temperature,
+                # Nucleus sampling cap keeps word choice in the most likely band -
+                # a voice persona sounds erratic when rare phrasings slip through,
+                # because the TTS renders each phrasing with different prosody.
+                top_p=float(os.getenv("LLM_TOP_P", "0.9")),
+                # Reasoning models silently spend max_completion_tokens on hidden
+                # reasoning and can return content="" (observed live with
+                # gpt-oss-20b at 60 tokens: finish_reason=length, empty reply).
+                # qwen supports "none"; gpt-oss only goes down to "low".
+                reasoning_effort=(
+                    "none" if groq_model.startswith("qwen/")
+                    else "low" if "gpt-oss" in groq_model
+                    else NOT_GIVEN
+                ),
                 max_retries=0,
             )
         )
@@ -1992,8 +2236,9 @@ def build_llm() -> llm.LLM:
     openai_fallback = openai.LLM(
         model=openai_model,
         api_key=required_env("OPENAI_API_KEY"),
-        max_completion_tokens=int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "90")),
-        temperature=float(os.getenv("LLM_TEMPERATURE", "0.25")),
+        max_completion_tokens=int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "60")),
+        temperature=float(os.getenv("LLM_TEMPERATURE", "0.3")),
+        top_p=float(os.getenv("LLM_TOP_P", "0.9")),
         max_retries=0,
     )
 
@@ -2187,7 +2432,7 @@ def _build_gemini_tts(voice_id: str | None) -> tts.TTS:
     )
 
 
-def build_tts(tts_provider: str = "smallest", voice_id: str | None = None) -> tts.TTS:
+def build_tts(tts_provider: str = "smallest", voice_id: str | None = None, speed_override: float | None = None) -> tts.TTS:
     """Sole TTS provider per call, selectable from {sarvam, rumik, smallest, gemini}.
 
     No FallbackAdapter, ever - a mid-call TTS provider switch changes the
@@ -2207,7 +2452,7 @@ def build_tts(tts_provider: str = "smallest", voice_id: str | None = None) -> tt
     if provider == "rumik":
         return _build_rumik_tts(voice_id)
     if provider == "smallest":
-        return _build_smallest_tts(voice_id)
+        return _build_smallest_tts(voice_id, speed_override=speed_override)
     return _build_sarvam_tts(voice_id)
 
 
@@ -2228,21 +2473,35 @@ def _build_greeting_tts(provider: str, voice_id: str | None) -> tts.TTS | None:
     return None
 
 
-def build_turn_handling() -> TurnHandlingOptions:
-    turn_detection = "stt"
+def build_turn_handling(silence_threshold: float = 0.35) -> TurnHandlingOptions:
+    # "vad": commit the turn at Silero end-of-speech once the final transcript
+    # is in. "stt": additionally wait for the provider's own end-of-turn signal
+    # - with Deepgram primary that signal (speech_final) was measured trailing
+    # its final transcripts by ~500-600ms, pushing EOU p50 to ~1.1s while
+    # transcript finals landed at 380-680ms. VAD mode removes that wait; the
+    # deterministic incomplete-fragment guard (looks_incomplete) protects
+    # against committing mid-sentence pauses. Set VOICE_TURN_DETECTION_MODE=stt
+    # to restore the old behaviour.
+    turn_detection = os.getenv("VOICE_TURN_DETECTION_MODE", "vad").strip().lower()
+    if turn_detection not in {"vad", "stt", "manual"}:
+        turn_detection = "vad"
     if multilingual_model is not None and env_flag("ENABLE_MULTILINGUAL_TURN_DETECTOR", False):
         turn_detection = multilingual_model()
     elif MultilingualModel is None:
-        logger.warning("livekit-agents-turn-detector is not installed; falling back to STT turn detection.")
+        logger.warning("livekit-agents-turn-detector is not installed; falling back to VAD/STT turn detection.")
 
-    min_delay = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.05"))
+    # Without a semantic turn-detector model the endpointing delay is always
+    # min_delay. 0.05 was tuned for stt mode where the provider's end-of-turn
+    # already added its own silence wait; in vad mode it would commit on the
+    # caller's first breath. 0.35s keeps natural turn-taking.
+    min_delay = float(silence_threshold)
     max_delay = min(float(os.getenv("MAX_ENDPOINTING_DELAY", "1.2")), 1.2)
     pipeline_event(
         "turn",
         "info",
         "Turn handling config",
-        "Semantic turn detector with aggressive endpointing configured",
-        turn_detection=type(turn_detection).__name__ if turn_detection != "stt" else "stt",
+        "Turn detection and endpointing configured",
+        turn_detection=turn_detection if isinstance(turn_detection, str) else type(turn_detection).__name__,
         min_endpointing_delay=min_delay,
         max_endpointing_delay=max_delay,
         hard_max_turn_silence_s=1.2,
@@ -2302,23 +2561,41 @@ def build_initial_context(preloaded_user: dict | None = None) -> llm.ChatContext
     initial_ctx.add_message(
         role="system",
         content=(
-            f"ROLE: You are Gracy, a warm, unhurried care coordinator for {clinic_name}, Indiranagar, Bengaluru. Goal: book appointments by phone, like a real person, never rushed. Never say AI/assistant/robot; if asked, say 'I am Gracy from reception here.' You already greeted: '{GREETING_TEXT}' - do not repeat it.\n"
-            "STYLE: Indian English, gentle, warm. Cushion questions with a short warm lead-in (Oh, absolutely... / Sure, let me check... / Don't worry, we'll sort this...). Use commas and ellipses for natural breathing pauses, but avoid saying 'umm' or 'hmm' as it causes audio lag. Ask exactly one question, then wait - never double-ask. Acknowledge corrections warmly: 'Oh, got it...'. Mirror Hindi/Hinglish/Kannada smoothly if caller uses it (e.g. 'Ji', 'beku', 'chahiye'). If caller sounds anxious, reassure briefly first ('you're in safe hands'). If interrupted or corrected, yield immediately.\n"
+            f"ROLE: You are Gracy, a warm, unhurried care coordinator for {clinic_name}, Indiranagar, Bengaluru. Goal: book appointments by phone, like a real person, never rushed. Keep one consistent, even tone from greeting to goodbye - never overly polished, formal, or corporate-enthusiastic. Never say AI/assistant/robot; if asked, say 'I am Gracy from reception here.' You already greeted: '{GREETING_TEXT}' - do not repeat it.\n"
+            "STYLE: Indian English, gentle, warm, TERSE. Short direct sentences - when one or two words answer the question, say just those words. Cushion questions with a short warm lead-in (Oh, absolutely... / Sure, let me check...). Use commas and ellipses for natural breathing pauses, but avoid saying 'umm' or 'hmm' as it causes audio lag. NEVER repeatedly say 'Thank you', 'Okay', 'Got it', or similar robotic fillers. Acknowledge with variety or simply proceed. Ask exactly one question, then wait - never double-ask. Acknowledge corrections warmly. Mirror Hindi/Hinglish/Kannada smoothly if caller uses it (e.g. 'Ji', 'beku', 'chahiye'). If caller sounds anxious, reassure briefly first ('you're in safe hands'). If interrupted or corrected, yield immediately.\n"
             "EDGE CASES: \n"
             "- THIRD-PARTY BOOKING: If someone is booking for a wife/daughter/friend, warmly ask 'Could you share the patient's name with me?' to separate caller from patient.\n"
             "- TRAFFIC/DELAYS: If caller says they are stuck in traffic (e.g. Silk Board, ORR), warmly reassure them 'Please come safely, take your time, we will inform the doctor'.\n"
             "- NETWORK DROPS: If audio is garbled or caller says 'voice is breaking', naturally say 'I am so sorry, the line isn't very clear, could you repeat that?'\n"
+            "- NOISE/UNCLEAR: If a turn is only noise or an unclear fragment, say 'Sorry, I didn't quite catch that' - never guess or invent what they said.\n"
+            "- HOLD/ASIDE: If the caller asks you to hold or talks to someone else in the room, say 'Sure, take your time' and wait quietly until they address you again.\n"
             "- EMERGENCY: If caller reports severe pain, bleeding, or acute distress, stop booking immediately and advise them to visit the nearest hospital emergency room right away.\n"
             "- FEES: If asked about consultation fees, say 'Consultation fees depend on the doctor, you can pay directly at the clinic.'\n"
-            "SPEECH FORMAT: Plain spoken prose only - no bullets, markdown, headers, JSON, or technical words. Say appointment diary instead of database. Phone/ID numbers digit-by-digit: 7-0-1-2. Times/dates in words. Bengaluru places broken for TTS: Kora-mangala, Indira-nagar, Jaya-nagar, Malle-shwaram, Maratha-halli, White-field.\n"
-            "SAFETY: Never diagnose or give medical/diet advice. Never ask for detailed symptoms or DOB - only the broad area (gynaecology, pregnancy, fertility, skin, diet, scans, physio, counselling), and route on that.\n"
-            "IDENTITY FIRST (always): collect patient name, then phone, as the first two turns - before doctor, concern, or timing. Soften it: 'Could you share the patient's name with me?' and 'And the best mobile number to reach you on?'. Ask name once, confirm once. Reject bad names: doctor, booking, yes/no. Ask phone separately, track corrections, repeat the final number digit-by-digit for confirmation.\n"
-            "O(1) CALL POLICY: Keep one state: intent, name, phone, doctor_or_area, date_time, appointment_id. Each turn either fills a missing field, calls a tool, or confirms.\n"
-            "OFF-TOPIC: Acknowledge briefly in one line, then pivot back to booking.\n"
-            "BOOK: After name and phone confirmed, ask their concern broadly. Call lookup_doctors silently. Go straight to lookup_booking_timings or find_slots and offer one or two slots naturally. Instantly call book_appointment -> give ID digit-by-digit.\n"
-            "FOLLOW-UP: After name and phone, call lookup_patient_history. If found, mention last visit date and doctor, then ask same doctor or new booking.\n"
-            "CHANGE/CANCEL: Verify phone. Time change: reschedule_appointment. Cancel: confirm, call cancel_appointment, offer to rebook. Narrate live: 'I am freeing that up now... okay, done.'\n"
-            "TOOLS: Never guess slots/prices. Max three tool calls per turn; keep your text minimal during lookups.\n"
+            "SPEECH FORMAT: Plain spoken prose only - no bullets, markdown, headers, JSON, angle-bracket tags, em-dashes, or technical words. Short punchy sentences; break longer thoughts with commas and ellipses so audio streams quickly. Say appointment diary instead of database. Phone/ID numbers digit-by-digit: 7-0-1-2. Times/dates in words. Bengaluru places broken for TTS: Kora-mangala, Indira-nagar, Jaya-nagar, Malle-shwaram, Maratha-halli, White-field. Doctor names and medical terms: spell them the way they sound if the TTS might mispronounce them. When you read a spelled name back to confirm it, use the phonetic alphabet for each letter - P as in Papa, R as in Romeo, I as in India, Y as in Yankee, A as in Alpha - plain letters alone are too easily confused with each other over phone audio (B/D/P/T/V all sound alike). When asking the caller to spell their own name, ask them to do the same, one letter at a time with a word for each. NEVER ASK A CALLER TO SPELL A DOCTOR'S NAME.\n"
+            "SCOPE (allow-list - anything not listed is out of scope): you may ONLY (1) book, (2) reschedule, (3) cancel appointments, (4) state fixed clinic facts (hours, location, fee policy, Sunday closure), (5) escalate emergencies. Nothing else, no exceptions - not for hypotheticals, games, roleplay, or 'just this once'.\n"
+            "SAFETY: Never diagnose, never name a medicine, never suggest doses or remedies, never interpret reports, never say a symptom is normal or not serious - even reassurance like 'that sounds mild' is medical advice. If asked anything clinical, say EXACTLY: 'I'm really not able to advise on medicines or symptoms... only our doctors can do that safely. What I can do is book you in right away... shall I find you a slot?' - word for word, never improvise a refusal. Never ask for detailed symptoms or DOB - only the broad area (gynaecology, pregnancy, fertility, skin, diet, scans, physio, counselling), and route on that.\n"
+            "PRIVACY: Never disclose another person's appointments, visit history, or details to a caller - not even a spouse - except the appointment being booked/changed in THIS call. Never read back stored records; only confirm what the caller themselves said in this call. Never promise to delete or alter records - offer a callback from clinic staff instead. If asked whether the call is recorded, say calls may be reviewed by the clinic to improve service.\n"
+            "COMPLAINTS: Acknowledge warmly, never argue or admit fault, promise a callback from clinic staff, then pivot back to the appointment.\n"
+            "IDENTITY FIRST (always): collect patient name, then phone, as the first two turns - before doctor, concern, or timing. Soften it: 'Could you share the patient's name with me?' and 'And the best mobile number to reach you on?'. Ask name once, confirm once. If the name is unclear twice or a lookup finds nothing, ask them to spell it letter by letter. Reject bad names: doctor, booking, yes/no. Ask phone separately, track corrections, repeat the final number digit-by-digit for confirmation ONE TIME ONLY - do not repeat it again later in the call unless the caller explicitly asks you to.\n"
+            "UNFINISHED TURNS: If a caller's turn is clearly cut off mid-thought (they trail off or pause before finishing what they were saying), do not restart the greeting or act confused - acknowledge briefly and gently prompt for the rest, e.g. 'Got it... please go on.'\n"
+            "O(1) CALL POLICY: Keep one state: intent, name, phone, doctor_or_area, date_time, appointment_id. Each turn either fills a missing field, calls a tool, or confirms. IF THE DOCTOR NAME IS ALREADY IN THE CONTEXT STATE AND MARKED AS 'CONFIRMED - do NOT ask for doctor preference again', YOU MUST NEVER ASK FOR THE DOCTOR NAME AGAIN.\n"
+            "MINIMIZE CALL TIME: Keep the conversation extremely brief to save money. Jump straight to the point. If you have the name and phone, directly ask what doctor/time they want and close the booking quickly without redundant confirmations.\n"
+            "DOCTOR CONFIRMATION: If the caller says a doctor's name, or you fetch it from STT, DO NOT repeatedly ask them to confirm it. Trust the name catching algorithm. Check the slots for that doctor immediately. Only confirm things if strictly necessary.\n"
+            "OFF-TOPIC / DERAILMENT: If the caller asks something unrelated to the current step (e.g., asking for directions, generic questions, or going off-script), answer it in ONE VERY SHORT SENTENCE (e.g. 'We are in Indiranagar'). Immediately after that sentence, you MUST ask the exact question required by your current STEP in the PATHWAY to forcefully bring them back on track. Never let the caller derail the flow.\n"
+            "BOOKING PATHWAY (EXTREMELY STRICT - DO NOT DEVIATE):\n"
+            "STEP 1 [IDENTITY]: Ask for the patient's name. Wait for their response.\n"
+            "STEP 2 [CONTACT]: Ask for their mobile number. Wait for their response. (DO NOT ask for doctor or concern until name and phone are collected).\n"
+            "STEP 3 [HISTORY]: Once name and phone are gathered, call lookup_patient_history. If a history exists, ask if they want to see the same doctor again. Wait for their response.\n"
+            "STEP 4 [DOCTOR/CONCERN]: If no history or new booking, ask for their medical concern. Then ask if they have a specific doctor in mind, or if they need a suggestion. If they name a doctor, you MUST call lookup_doctors. If they need a suggestion, you MUST call suggest_doctor.\n"
+            "STEP 5 [TIMING]: Once a doctor is confirmed, ask for their preferred date. NEVER invent or guess a time slot. You MUST call find_slots or lookup_booking_timings immediately. Read ALL available slots exactly as returned.\n"
+            "STEP 6 [BOOKING]: Once they choose a slot, you MUST call book_appointment. NEVER confirm a booking without calling this tool.\n"
+            "STEP 7 [CLOSURE]: Read the confirmation ID back to them digit-by-digit.\n"
+            "CHANGE/CANCEL PATHWAY (EXTREMELY STRICT - DO NOT DEVIATE):\n"
+            "STEP 1: Verify phone number, then call lookup_appointments to find the booking. NEVER GUESS an appointment ID.\n"
+            "STEP 2: If exactly one upcoming appointment, confirm THAT one is the one they mean. If more than one, read them briefly and ask which.\n"
+            "STEP 3 for TIME CHANGE: Call reschedule_appointment. Narrate live: 'I am freeing that up now... okay, done.'\n"
+            "STEP 3 for CANCEL: Confirm once, call cancel_appointment, then offer to rebook.\n"
+            "TOOLS: Never guess slots/prices. Max three tool calls per turn. Before a lookup say one short warm lead-in ('One moment please...' / 'Let me pull up the schedule...'), nothing more.\n"
             "GOOD STYLE: 'Could you share the patient's name with me?' 'And the best mobile number to reach you on?' 'What brings you to the clinic today, is it a general checkup or something specific?' 'I have a slot tomorrow morning at eleven thirty with Dr. Priya... does that work for you?'\n"
             "CLOSE: Ask once if anything else. If no, wish them well ('Have a beautiful day ahead in Namma Bengaluru') and say 'Pranaam and take care!' -> end_call. Never say Namaste at ending."
         ),
@@ -2364,6 +2641,136 @@ _FAST_PHONE_PROMPT_RE = re.compile(r"\b(number|phone|mobile|reach you)\b", re.IG
 _FAST_PHONE_FILLER_RE = re.compile(
     r"[\d\s\-+.,]|\b(?:my|the|number|phone|mobile|is|it'?s|its|ji|haan|yes|ok|okay)\b", re.IGNORECASE
 )
+_FAST_NAME_PROMPT_RE = re.compile(r"\b(?:your|patient(?:'s)?)\s+(?:full\s+)?name\b|\bname,?\s+please\b", re.IGNORECASE)
+# An explicit goodbye as its own turn - the ONE farewell case that's safe to
+# resolve deterministically. "No, that's all" / "nothing else" style closes
+# stay on the LLM path (they're answers to a question, not farewells).
+_FAST_GOODBYE_RE = re.compile(
+    r"^(?:ok(?:ay)?[,.! ]+)?(?:no[,.! ]+)?(?:that'?s\s+all[,.! ]+)?"
+    r"(?:thank(?:s|\s+you)(?:\s+so\s+much|\s+a\s+lot)?[,.! ]+)*"
+    r"(?:good)?bye+(?:[- ]bye+)?[\s.!]*$",
+    re.IGNORECASE,
+)
+GOODBYE_TEXT = (
+    "Thank you for calling MyStree Clinic... have a beautiful day ahead. "
+    "Pranaam and take care!"
+)
+# Markers unique to the scripted farewell lines (prompt CLOSE + GOODBYE_TEXT).
+# Spoken by the agent = the conversation is over; used to auto-end the call.
+_FAREWELL_RE = re.compile(r"pranaam|have\s+a\s+beautiful\s+day", re.IGNORECASE)
+_INCOMPLETE_ENDINGS = (
+    "my name is",
+    "my number is",
+    "my phone number is",
+    "i want to",
+    "i would like to",
+    "can you",
+    "it is",
+)
+
+
+def looks_incomplete(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (text or "").lower()).strip(" .?!,:")
+    return any(normalized.endswith(ending) for ending in _INCOMPLETE_ENDINGS)
+
+
+# Indian-English STT commonly renders "my name is" as "my name it",
+# "my names", or "my name's". The introduction is removed before validating
+# the value so it can never become part of the patient name.
+_NAME_INTRO_RE = re.compile(
+    r"^\s*(?:(?:yes|yeah|hi|hello|okay|ok)[, ]+)*"
+    r"(?:my\s+names?(?:\s+is|\s+it|\s+its|'s|\s+was)?|name\s+is|this\s+is|i\s+am|i'm)"
+    r"[,.: -]+",
+    re.IGNORECASE,
+)
+# A caller answer with NO name introduction is only a name if it's one or two
+# words and none of them is ordinary conversation. Without this screen,
+# "Hello? Are you there?" was captured as the patient name "Hello Are You
+# There" - a live bug, not a hypothetical.
+_BARE_NAME_STOPWORDS = {
+    "hello", "hi", "hey", "namaste", "haan", "ji",
+    "yes", "yeah", "yep", "no", "nope", "ok", "okay", "correct", "right", "fine", "sure",
+    "thanks", "thank", "you", "welcome", "sorry", "please", "nothing", "wait", "hold",
+    "are", "there", "can", "could", "hear", "me", "am", "is", "it", "its", "the", "a", "an",
+    "what", "who", "when", "where", "how", "why", "which",
+    "today", "tomorrow", "kal", "parso", "morning", "evening", "afternoon",
+    "appointment", "booking", "book", "cancel", "reschedule", "repeat", "again",
+    "doctor", "dr", "clinic", "madam", "sir",
+}
+_NAME_FORBIDDEN_WORDS = {"my", "name", "phone", "number", "appointment", "book", "cancel", "reschedule"}
+
+
+def extract_spoken_name(text: str) -> str | None:
+    raw = (text or "").strip()
+    # A question is never a name, whatever else it looks like.
+    if not raw or "?" in raw:
+        return None
+    cleaned = re.sub(r"[^A-Za-z .'-]", " ", raw)
+    cleaned, intro_matched = _NAME_INTRO_RE.subn("", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,'-")
+    if not cleaned or len(cleaned) > 60:
+        return None
+    words = cleaned.split()
+    if intro_matched:
+        # Explicit "my name is ..." style: allow up to 4 words after the intro.
+        if len(words) > 4:
+            return None
+    else:
+        # Bare candidate: strict. Short, and no ordinary-conversation words.
+        if len(words) > 2:
+            return None
+        if any(w.lower().strip(".'-") in _BARE_NAME_STOPWORDS for w in words):
+            return None
+    if any(w.lower().strip(".'-") in _NAME_FORBIDDEN_WORDS for w in words):
+        return None
+    if not is_valid_patient_name(cleaned):
+        return None
+    return cleaned.title()
+
+
+# Words a caller naturally wraps around a spelled-out name; anything else
+# mid-sequence aborts assembly (a real sentence, not a spelling).
+_SPELL_FILLER_WORDS = {"yeah", "yes", "ok", "okay", "its", "it's", "my", "name", "is", "spelled", "spelling", "so", "the"}
+_SPELL_PROMPT_RE = re.compile(r"\bspell\b", re.IGNORECASE)
+
+
+def assemble_spelled_name(text: str) -> str | None:
+    """Reassemble a letter-by-letter spelling into a name.
+
+    Handles the three ways callers actually spell over the phone:
+    'P R I Y A', 'P, R, I, Y, A', and the phonetic form the agent now asks
+    for - 'P as in Papa, R as in Romeo'. The previous pipeline had no
+    deterministic handling at all: a spelled sequence went to the LLM as a
+    fragment soup ('it's d a l a') and the model guessed. Aborts on any
+    unexpected word so an ordinary sentence can never be misread as a
+    spelling.
+    """
+    cleaned = re.sub(r"[.,]", " ", (text or "").lower())
+    tokens = cleaned.split()
+    letters: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i].strip("'-")
+        if len(tok) == 1 and tok.isalpha():
+            # 'p as in papa' - consume the phonetic scaffold with the letter
+            if i + 3 < len(tokens) and tokens[i + 1] == "as" and tokens[i + 2] == "in":
+                letters.append(tok)
+                i += 4
+                continue
+            letters.append(tok)
+            i += 1
+            continue
+        if tok == "double" and i + 1 < len(tokens) and len(tokens[i + 1].strip("'-")) == 1:
+            letters.extend([tokens[i + 1].strip("'-")] * 2)
+            i += 2
+            continue
+        if tok in _SPELL_FILLER_WORDS and not letters:
+            i += 1  # leading filler before the spelling starts
+            continue
+        return None  # unexpected word mid-sequence: not a spelling
+    if 3 <= len(letters) <= 20:
+        return "".join(letters).title()
+    return None
 
 
 def fast_path_reply(user_text: str, last_agent_text: str) -> tuple[str, str] | None:
@@ -2374,6 +2781,23 @@ def fast_path_reply(user_text: str, last_agent_text: str) -> tuple[str, str] | N
 
     if last_agent_text and _FAST_REPEAT_RE.match(text):
         return ("repeat", f"Of course... {last_agent_text}")
+
+    if looks_incomplete(text):
+        return ("incomplete", "")
+
+    if _FAST_GOODBYE_RE.match(text):
+        return ("goodbye", GOODBYE_TEXT)
+
+    expecting_name = bool(last_agent_text) and bool(
+        _FAST_NAME_PROMPT_RE.search(last_agent_text) or _SPELL_PROMPT_RE.search(last_agent_text)
+    )
+    if expecting_name:
+        spelled = assemble_spelled_name(text)
+        if spelled:
+            return ("name_captured", f"Thanks, {spelled}. May I have your phone number?")
+        name = extract_spoken_name(text)
+        if name:
+            return ("name_captured", f"Thanks, {name}. May I have your phone number?")
 
     # A bare phone number, spoken right after we asked for the number: echo it
     # back digit-by-digit for confirmation (exactly what the prompt tells the
@@ -2390,6 +2814,311 @@ def fast_path_reply(user_text: str, last_agent_text: str) -> tuple[str, str] | N
     return None
 
 
+# --- Eager clause-level TTS chunking -----------------------------------------
+# livekit-agents' default tts_node wraps any non-natively-streaming TTS
+# (Smallest.ai, Rumik, Gemini here - Sarvam already streams natively over its
+# own WebSocket) in tokenize.blingfire.SentenceTokenizer, which only ever cuts
+# text at a FULL sentence boundary (.!?). For a longer reply sentence, that
+# means TTS waits for the whole sentence to finish generating before it can
+# start synthesizing any of it - measured live, LLM generation runs
+# ~100 tokens/s on Groq (see turn_latency logs), so a 15-20 word first
+# sentence costs an extra ~120-180ms of pure waiting before the first TTS
+# request is even sent, on top of the TTS request's own latency.
+# This tokenizer additionally cuts at a clause boundary (comma/semicolon/
+# colon/em-dash) once the buffered clause is long enough to sound natural on
+# its own, so the first chunk reaches TTS sooner. Mirrors the min/max
+# buffer-size knobs already tuned for Sarvam's native streaming
+# (SARVAM_MIN_BUFFER_SIZE/SARVAM_MAX_CHUNK_LENGTH) so the same tuning applies
+# uniformly. Trade-off: an independent TTS call per clause loses a small
+# amount of cross-clause prosody compared to synthesizing the whole sentence
+# at once - acceptable for a short clinic reply, verify by listening before
+# assuming it's free.
+_TTS_CLAUSE_CUT_RE = re.compile(r"[.!?…][\"'”’]?\s+|[,;:]\s+|—\s+")
+
+
+class EagerClauseSentenceStream(SentenceStream):
+    def __init__(self, *, min_chunk_chars: int, max_chunk_chars: int,
+                 rest_min_chunk_chars: int | None = None) -> None:
+        super().__init__()
+        self._buf = ""
+        self._min_chunk_chars = min_chunk_chars
+        self._max_chunk_chars = max_chunk_chars
+        # Adaptive chunking: only the FIRST chunk uses the small eager
+        # threshold - that's the one that determines time-to-first-audio.
+        # Every later chunk waits for a bigger buffer, because each chunk is
+        # an independent TTS synthesis and every boundary between two chunks
+        # is an audible prosody seam ("voice breaking"). One small chunk +
+        # few large ones keeps the latency win while roughly halving the
+        # number of seams per reply versus cutting at every clause.
+        self._rest_min_chunk_chars = rest_min_chunk_chars or min_chunk_chars
+        self._emitted_first = False
+        self._segment_id = shortuuid()
+
+    @property
+    def _active_min(self) -> int:
+        return self._min_chunk_chars if not self._emitted_first else self._rest_min_chunk_chars
+
+    def _find_cut(self) -> int | None:
+        buf = self._buf
+        n = len(buf)
+        if n == 0:
+            return None
+        if n >= self._max_chunk_chars:
+            # Force a cut before the buffer grows unbounded (e.g. a long
+            # run-on sentence with no punctuation at all). Cut at the last
+            # word boundary so we never split a word in half.
+            space = buf.rfind(" ", self._active_min, self._max_chunk_chars)
+            return (space + 1) if space != -1 else self._max_chunk_chars
+        for match in _TTS_CLAUSE_CUT_RE.finditer(buf):
+            if match.end() >= self._active_min:
+                return match.end()
+        return None
+
+    def push_text(self, text: str) -> None:
+        self._check_not_closed()
+        self._buf += text
+        while True:
+            cut = self._find_cut()
+            if cut is None:
+                return
+            chunk, self._buf = self._buf[:cut].strip(), self._buf[cut:].lstrip()
+            if chunk:
+                self._event_ch.send_nowait(TokenData(token=chunk, segment_id=self._segment_id))
+                self._emitted_first = True
+
+    def flush(self) -> None:
+        self._check_not_closed()
+        remainder = self._buf.strip()
+        if remainder:
+            self._event_ch.send_nowait(TokenData(token=remainder, segment_id=self._segment_id))
+        self._buf = ""
+        self._segment_id = shortuuid()
+        self._emitted_first = False
+
+    def end_input(self) -> None:
+        self.flush()
+        self._event_ch.close()
+
+    async def aclose(self) -> None:
+        self._event_ch.close()
+
+
+class EagerClauseTokenizer(SentenceTokenizer):
+    """Drop-in tokenize.SentenceTokenizer for tts.StreamAdapter - see the
+    module-level comment above for why this exists instead of the framework
+    default (tokenize.blingfire.SentenceTokenizer)."""
+
+    def __init__(self, *, min_chunk_chars: int = 35, max_chunk_chars: int = 160,
+                 rest_min_chunk_chars: int = 90) -> None:
+        self._min_chunk_chars = min_chunk_chars
+        self._max_chunk_chars = max_chunk_chars
+        self._rest_min_chunk_chars = rest_min_chunk_chars
+
+    def tokenize(self, text: str, *, language: str | None = None) -> list[str]:
+        from livekit.agents.utils.aio import ChanClosed, ChanEmpty
+
+        stream = self.stream(language=language)
+        stream.push_text(text)
+        stream.end_input()
+        chunks: list[str] = []
+        try:
+            while True:
+                chunks.append(stream._event_ch.recv_nowait().token)
+        except (ChanClosed, ChanEmpty):
+            pass
+        return chunks
+
+    def stream(self, *, language: str | None = None) -> SentenceStream:
+        return EagerClauseSentenceStream(
+            min_chunk_chars=self._min_chunk_chars,
+            max_chunk_chars=self._max_chunk_chars,
+            rest_min_chunk_chars=self._rest_min_chunk_chars,
+        )
+
+
+def _safe_say(session, text: str) -> None:
+    """session.say() is synchronous and raises RuntimeError("AgentSession
+    isn't running") immediately if the session has already died (observed
+    live: WebRTC data channels can close unexpectedly without the room's
+    connection_state reflecting it for 10+ seconds). The deterministic
+    fast-path and FAQ cache call this instead of session.say() directly so a
+    dead session fails one turn instead of raising out of
+    on_user_turn_completed uncaught.
+    """
+    try:
+        session.say(text, allow_interruptions=True)
+    except Exception:
+        pipeline_event(
+            "turn", "warn", "Deterministic reply failed to speak",
+            "session.say() raised - the AgentSession may have died",
+            traceback=traceback.format_exc(),
+        )
+
+
+@dataclasses.dataclass
+class CallState:
+    """Ground-truth booking progress for one call, threaded through
+    AgentSession.userdata (RunContext.userdata gives every tool the same
+    object; GracyAgent reaches it via self.session.userdata).
+
+    Why this exists: the previous design relied entirely on the LLM
+    re-reading raw transcript history to figure out "what have we already
+    collected" - reliable for a short exchange, but on a real call (STT
+    garbling a name into repeated nonsense, a caller re-explaining their
+    concern, 15+ turns) the LLM was observed re-asking for the name and the
+    phone number well after both had already been given and confirmed. This
+    object is the single source of truth instead: it is updated at the exact
+    moment something is captured (fast path, tool calls) and its summary is
+    injected into every LLM call fresh, so the model is told directly what
+    is already known rather than asked to infer it.
+    """
+
+    name: str | None = None
+    name_confirmed: bool = False
+    phone: str | None = None
+    phone_confirmed: bool = False
+    phone_pending: str | None = None  # digits awaiting a yes/no confirmation
+    doctor_preference_asked: bool = False
+    doctor: str | None = None
+    booking_confirmed: bool = False
+    appointment_id: int | None = None
+    abuse_strikes: int = 0
+
+    def summary(self) -> str:
+        if self.name:
+            name_str = self.name + (" (confirmed)" if self.name_confirmed else "")
+        else:
+            name_str = "NOT YET COLLECTED - ask for it"
+
+        if self.phone and self.phone_confirmed:
+            phone_str = self.phone + " (confirmed)"
+        elif self.phone_pending:
+            phone_str = (
+                f"caller gave {self.phone_pending} - do NOT ask for the number again; "
+                "if you have not yet repeated it digit-by-digit for confirmation, do that now, "
+                "otherwise just wait for their yes/no"
+            )
+        else:
+            phone_str = "NOT YET COLLECTED - ask for it"
+
+        booking_str = str(self.booking_confirmed)
+        if self.appointment_id:
+            booking_str += f" (appointment ID {self.appointment_id})"
+
+        doctor_str = "not yet chosen"
+        if self.doctor:
+            doctor_str = f"{self.doctor} (CONFIRMED - do NOT ask for doctor preference again)"
+
+        parts = [
+            f"patient_name={name_str}",
+            f"phone_number={phone_str}",
+            f"doctor_preference_question_asked={self.doctor_preference_asked}",
+            f"doctor={doctor_str}",
+            f"booking_confirmed={booking_str}",
+        ]
+        return "; ".join(parts)
+
+
+# Agent utterances that put the caller under high cognitive load - thinking,
+# recalling, or spelling - where a fast endpoint cuts them off mid-effort.
+_VAD_SLOW_TRIGGER_RE = re.compile(
+    r"spell|letter by letter|your name|name,?\s+please|what brings you"
+    r"|describe|your concern|tell me more|which doctor|doctor in mind",
+    re.IGNORECASE,
+)
+
+
+class DynamicVADController:
+    """Adaptive end-of-utterance timing, one instance per call.
+
+    Toggles the session's endpointing min_delay between a fast default and a
+    slower "the caller is thinking/spelling" value, based on what the agent
+    just asked - lightweight regex on the agent's own outgoing text, no
+    models (Render memory limits rule out a semantic classifier).
+
+    Deliberate deviations from the naive approach:
+    - The knob is the session's endpointing min_delay via the PUBLIC
+      session.update_options(endpointing_opts=...) API - NOT the Silero VAD
+      instance's min_silence_duration. The VAD object is shared across
+      concurrent calls via proc.userdata; mutating it would change turn
+      timing for every other live call on this worker.
+    - Perceived silence before commit ~= VAD silence (0.2s) + min_delay, so
+      the state values are calibrated to land at roughly 0.55s fast / 1.2s
+      slow / 1.5s fragment-recovery total.
+    - FAST reuses the MIN_ENDPOINTING_DELAY env default so enabling this
+      feature changes nothing about the tuned baseline.
+    """
+
+    def __init__(self, session) -> None:
+        self._session = session
+        self._state = "TRANSACTIONAL"
+        self._delays = {
+            "TRANSACTIONAL": float(os.getenv("MIN_ENDPOINTING_DELAY", "0.35")),
+            "HIGH_COGNITIVE_LOAD": float(os.getenv("VAD_ENDPOINT_SLOW_S", "1.0")),
+            "FRAGMENT_RECOVERY": float(os.getenv("VAD_ENDPOINT_FRAGMENT_S", "1.3")),
+        }
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    def _apply(self, new_state: str, reason: str) -> None:
+        if new_state == self._state:
+            return
+        delay = self._delays[new_state]
+        try:
+            self._session.update_options(endpointing_opts={"min_delay": delay})
+        except Exception:
+            # A dead/closing session must never take down the turn that
+            # triggered the change - endpointing just stays where it was.
+            logger.warning("Adaptive VAD update failed; keeping previous endpointing", exc_info=True)
+            return
+        self._state = new_state
+        pipeline_event(
+            "turn", "info", "Adaptive VAD mode",
+            reason,
+            event="vad_mode", state=new_state,
+            threshold_ms=round(delay * 1000),
+        )
+
+    def evaluate_agent_text(self, text: str) -> None:
+        """Called with what the agent just said; sets the wait for the
+        caller's NEXT turn."""
+        if not text:
+            return
+        if _VAD_SLOW_TRIGGER_RE.search(text):
+            self._apply("HIGH_COGNITIVE_LOAD", "Agent asked a high-cognitive-load question")
+        else:
+            self._apply("TRANSACTIONAL", "Agent asked a closed/transactional question")
+
+    def fragment_recovery(self) -> None:
+        """The caller was cut off mid-sentence (looks_incomplete fired) -
+        wait noticeably longer for the rest instead of just dropping it."""
+        self._apply("FRAGMENT_RECOVERY", "Incomplete fragment detected; extending the listen window")
+
+    def on_user_turn(self) -> None:
+        """A user turn arrived. Fragment recovery is one-shot: the extended
+        window applied to this turn; drop back to the fast default (the
+        agent's next reply re-evaluates anyway)."""
+        if self._state == "FRAGMENT_RECOVERY":
+            self._apply("TRANSACTIONAL", "Fragment window consumed; back to fast endpointing")
+
+
+# Only used for the ONE narrow case where a bare "yes"/"no" is now safe to
+# resolve deterministically: confirming a phone number that was just echoed
+# back digit-by-digit (state.phone_pending is set). Every other bare yes/no
+# in the call remains LLM-routed, exactly as before - this does not turn
+# into a generic yes/no keyword matcher.
+_AFFIRMATIVE_RE = re.compile(
+    r"^(?:yeah|yes|yep|yup|correct|right|haan|ji|thats?\s+right|thats?\s+correct|sounds?\s+good|ok(?:ay)?)[\s.!]*$",
+    re.IGNORECASE,
+)
+_NEGATIVE_RE = re.compile(
+    r"^(?:no|nope|nah|wrong|thats?\s+not\s+(?:right|correct)|incorrect)[\s.!]*$",
+    re.IGNORECASE,
+)
+
+
 class GracyAgent(Agent):
     """Agent subclass adding the deterministic fast path via the framework's
     own on_user_turn_completed hook. Raising StopResponse skips LLM generation
@@ -2397,9 +3126,103 @@ class GracyAgent(Agent):
     history, so the LLM sees a coherent transcript on the next turn.
     """
 
+    def __init__(self, *args, faq_cache_instance: faq_cache.FaqCache | None = None,
+                 faq_client=None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._faq_cache = faq_cache_instance
+        self._faq_client = faq_client
+        # Attached by entrypoint() right after session.start() (needs a live
+        # session); None means adaptive VAD is off and everything behaves
+        # exactly as before.
+        self._vad_controller: DynamicVADController | None = None
+        self._farewell_hangup_scheduled = False
+
+    def _vad_eval(self, spoken_text: str) -> None:
+        if self._vad_controller is not None:
+            try:
+                self._vad_controller.evaluate_agent_text(spoken_text)
+            except Exception:
+                logger.warning("Adaptive VAD evaluation failed", exc_info=True)
+
+    def _maybe_schedule_farewell_hangup(self, spoken_text: str) -> None:
+        """Deterministic session end: if the agent itself just spoke its
+        scripted farewell, hang up after playout - regardless of whether the
+        LLM remembered to call the end_call tool.
+
+        This closes the main leak: the CLOSE flow instructs the model to say
+        'Pranaam and take care!' THEN call end_call, but models regularly
+        speak the farewell and skip the tool call, leaving the call open
+        until the silence timeout (~45-75s) finally fires. The farewell
+        phrases are unique to the scripted closing lines (prompt CLOSE +
+        GOODBYE_TEXT), so this cannot fire mid-conversation.
+        """
+        if self._farewell_hangup_scheduled:
+            return
+        if not spoken_text or not _FAREWELL_RE.search(spoken_text):
+            return
+        self._farewell_hangup_scheduled = True
+        pipeline_event(
+            "worker", "ok", "Farewell spoken - auto-ending call",
+            "Agent spoke its scripted goodbye; room will be deleted after playout",
+            event="farewell_auto_hangup",
+        )
+        try:
+            schedule_hangup_after_playout(self.session)
+        except Exception:
+            logger.warning("Farewell hangup scheduling failed", exc_info=True)
+
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        try:
+            state: CallState = self.session.userdata
+        except Exception:
+            state = None  # session not carrying userdata (e.g. a stray test call) - degrade gracefully
+
+        if self._vad_controller is not None:
+            self._vad_controller.on_user_turn()  # one-shot fragment window consumed
+
+        # --- Safety guardrails: run FIRST, on their own flag, never gated by
+        # the latency fast-path toggle. Deterministic input gate: a medical/
+        # emergency/jailbreak turn is answered with a fixed approved script
+        # and StopResponse - the LLM never receives the turn, so it cannot
+        # hallucinate an answer to it. See guardrails.py for the patterns
+        # and the false-positive discipline ("I have a fever, book me" must
+        # flow through; "I have a fever, what medicine" must not).
+        if env_flag("VOICE_GUARDRAILS_ENABLED", True):
+            try:
+                category = guardrails.classify_turn(new_message.text_content or "")
+            except Exception:
+                logger.warning("Guardrail classifier failed; turn continues normally", exc_info=True)
+                category = None
+            if category == "abuse":
+                strikes = 1
+                if state is not None:
+                    state.abuse_strikes += 1
+                    strikes = state.abuse_strikes
+                pipeline_event(
+                    "llm", "warn", "Guardrail: abusive language",
+                    f"Strike {strikes} - {'warning issued' if strikes < 2 else 'ending the call'}",
+                    event="guardrail_triggered", category="abuse", strikes=strikes,
+                )
+                if strikes >= 2:
+                    _safe_say(self.session, guardrails.ABUSE_GOODBYE_SCRIPT)
+                    schedule_hangup_after_playout(self.session)
+                else:
+                    _safe_say(self.session, guardrails.ABUSE_WARNING_SCRIPT)
+                raise StopResponse()
+            if category is not None:
+                pipeline_event(
+                    "llm", "warn", f"Guardrail: {category}",
+                    "Turn answered with the approved script; the LLM never saw it",
+                    event="guardrail_triggered", category=category,
+                    response_path="deterministic",
+                )
+                _safe_say(self.session, guardrails.SCRIPTS[category])
+                self._vad_eval(guardrails.SCRIPTS[category])
+                raise StopResponse()
+
         if not env_flag("VOICE_FAST_PATH_ENABLED", True):
             return
+
         try:
             user_text = new_message.text_content or ""
             last_agent_text = ""
@@ -2407,28 +3230,326 @@ class GracyAgent(Agent):
                 if getattr(item, "role", None) == "assistant":
                     last_agent_text = item.text_content or ""
                     break
+
+            # State-aware phone confirmation. Bare yes/no is normally left to
+            # the LLM (right answer depends on state this codebase didn't
+            # used to track) - but state.phone_pending now makes it
+            # unambiguous, so resolving it deterministically here removes an
+            # entire LLM round-trip from the single most common turn in the
+            # call, and guarantees the phone is never silently re-asked.
+            if state is not None and state.phone_pending:
+                stripped = user_text.strip()
+                if _AFFIRMATIVE_RE.match(stripped):
+                    state.phone = state.phone_pending
+                    state.phone_confirmed = True
+                    state.phone_pending = None
+                    pipeline_event(
+                        "llm", "ok", "Deterministic fast path",
+                        "Phone confirmed without LLM (state-aware yes)",
+                        event="fast_path", response_path="deterministic", kind="phone_confirmed_yes",
+                    )
+                    _safe_say(self.session, "Thank you... what brings you in today?")
+                    self._vad_eval("Thank you... what brings you in today?")
+                    raise StopResponse()
+                if _NEGATIVE_RE.match(stripped):
+                    state.phone_pending = None
+                    pipeline_event(
+                        "llm", "ok", "Deterministic fast path",
+                        "Phone rejected without LLM (state-aware no)",
+                        event="fast_path", response_path="deterministic", kind="phone_confirmed_no",
+                    )
+                    _safe_say(self.session, "Sorry about that... could you say the number again?")
+                    self._vad_eval("Sorry about that... could you say the number again?")
+                    raise StopResponse()
+
+            # A phone number spoken INSIDE a sentence ("I want to cancel, my
+            # number is 70128...") doesn't fire the bare-number fast path -
+            # the LLM answers that turn. Stage it here anyway so (a) the
+            # state summary stops the LLM from re-asking for it, and (b) the
+            # caller's next bare "yes" resolves deterministically above.
+            if (
+                state is not None
+                and not state.phone_confirmed
+                and not state.phone_pending
+            ):
+                sentence_phone = extract_phone_candidate(user_text)
+                if sentence_phone:
+                    digits = re.sub(r"\D", "", db_helper.normalize_phone(sentence_phone))[-10:]
+                    if len(digits) == 10:
+                        state.phone_pending = "-".join(digits)
+
             decision = fast_path_reply(user_text, last_agent_text)
+        except StopResponse:
+            raise
         except Exception:
             # Router bugs must never take down a turn - fall through to the LLM.
             logger.warning("Fast-path router failed; using LLM for this turn", exc_info=True)
             return
         if decision is None:
+            # Not a deterministic match. Try the static FAQ cache next - still
+            # before the LLM, still skipped entirely if it's not ready/enabled.
+            if self._faq_cache is not None and self._faq_cache.ready:
+                try:
+                    hit = await self._faq_cache.lookup(user_text, self._faq_client)
+                except Exception:
+                    logger.warning("FAQ cache lookup failed; using LLM for this turn", exc_info=True)
+                    hit = None
+                if hit is not None:
+                    intent, reply, score = hit
+                    pipeline_event(
+                        "llm", "ok", "FAQ cache hit",
+                        f"Turn answered from FAQ cache ({intent}, score={score:.3f})",
+                        event="faq_cache_hit", response_path="deterministic",
+                        intent=intent, score=round(score, 4),
+                    )
+                    _safe_say(self.session, reply)
+                    self._vad_eval(reply)
+                    raise StopResponse()
             return
         kind, reply = decision
+        if kind == "goodbye":
+            pipeline_event(
+                "llm", "ok", "Deterministic fast path",
+                "Explicit goodbye - closing the call without LLM",
+                event="fast_path", response_path="deterministic", kind="goodbye",
+            )
+            _safe_say(self.session, reply)
+            self._farewell_hangup_scheduled = True  # don't double-schedule via tts_node
+            schedule_hangup_after_playout(self.session)
+            raise StopResponse()
+        if state is not None and kind == "name_captured":
+            state.name = assemble_spelled_name(user_text) or extract_spoken_name(user_text)
+            state.name_confirmed = True
+            if state.phone_confirmed:
+                # Cancel/reschedule flows collect the phone first - don't ask
+                # for a number we already have.
+                reply = f"Thanks, {state.name}."
+        if state is not None and kind == "phone_confirm":
+            phone = extract_phone_candidate(user_text)
+            if phone:
+                state.phone_pending = "-".join(re.sub(r"\D", "", db_helper.normalize_phone(phone))[-10:])
         pipeline_event(
             "llm", "ok", "Deterministic fast path",
             f"Turn answered without LLM ({kind})",
             event="fast_path", response_path="deterministic", kind=kind,
         )
-        self.session.say(reply, allow_interruptions=True)
+        if kind == "incomplete":
+            # Turn the passive fragment filter into an active listener: the
+            # caller was cut off mid-sentence, so extend the next commit's
+            # wait instead of just staying silent with the fast window.
+            if self._vad_controller is not None:
+                self._vad_controller.fragment_recovery()
+        else:
+            _safe_say(self.session, reply)
+            self._vad_eval(reply)
         raise StopResponse()
+
+    async def llm_node(self, chat_ctx, tools, model_settings):
+        """Expose only visible assistant text and recover from empty completions."""
+        # Ground-truth state injected fresh on every single generation - not
+        # once at call start - so the model is TOLD what's already known
+        # instead of having to infer it from a long, sometimes-garbled
+        # transcript. This is what stops the re-ask-the-name/phone bug: the
+        # model doesn't need to get the inference right anymore.
+        try:
+            state: CallState = self.session.userdata
+            chat_ctx = chat_ctx.copy()
+            chat_ctx.add_message(
+                role="system",
+                content=(
+                    "# CURRENT CALL STATE (ground truth - never ask again for "
+                    f"anything already collected or confirmed below)\n{state.summary()}"
+                ),
+            )
+        except Exception:
+            pass  # no userdata on this session - proceed without state injection
+
+        text_length = 0
+        tool_calls_seen = False
+        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+            delta = getattr(chunk, "delta", None)
+            content = getattr(delta, "content", None) if delta is not None else None
+            if isinstance(chunk, str):
+                content = chunk
+            if content:
+                text_length += len(content)
+            if delta is not None and getattr(delta, "tool_calls", None):
+                tool_calls_seen = True
+            yield chunk
+
+        # A tool-only completion is a VALID model response (the tool loop
+        # continues this same logical turn) - it must never be labelled or
+        # treated as an empty failure, and must never trigger the fallback.
+        if text_length:
+            validated_label, validated_message = "LLM text ready for TTS", "Visible assistant content validated"
+        elif tool_calls_seen:
+            validated_label, validated_message = "Tool-only LLM completion", "Model returned tool calls; tool loop continues this turn"
+        else:
+            validated_label, validated_message = "Empty LLM completion", "No visible assistant content and no tool calls were produced"
+        pipeline_event(
+            "llm",
+            "ok" if text_length or tool_calls_seen else "warn",
+            validated_label,
+            validated_message,
+            event="llm_output_validated",
+            text_present=bool(text_length),
+            text_length=text_length,
+            tool_calls_present=tool_calls_seen,
+        )
+        if not text_length and not tool_calls_seen:
+            # A successful empty completion cannot be retried by LiveKit's
+            # provider adapter, so explicitly ask the stable OpenAI model for
+            # this turn. This is intentionally created only on the rare empty
+            # path and never delays healthy streamed responses.
+            fallback = openai.LLM(
+                model=os.getenv("OPENAI_LLM_MODEL", os.getenv("LLM_MODEL", "gpt-4o-mini")),
+                api_key=required_env("OPENAI_API_KEY"),
+                max_completion_tokens=int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "60")),
+                temperature=float(os.getenv("LLM_TEMPERATURE", "0.3")),
+                top_p=float(os.getenv("LLM_TOP_P", "0.9")),
+                max_retries=0,
+            )
+            fallback_text_length = 0
+            fallback_tool_calls = False
+            tool_choice = model_settings.tool_choice if model_settings else NOT_GIVEN
+            conn_options = self.session.conn_options.llm_conn_options
+            try:
+                async with fallback.chat(
+                    chat_ctx=chat_ctx,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    conn_options=conn_options,
+                ) as stream:
+                    async for chunk in stream:
+                        delta = getattr(chunk, "delta", None)
+                        content = getattr(delta, "content", None) if delta is not None else None
+                        if content:
+                            fallback_text_length += len(content)
+                        if delta is not None and getattr(delta, "tool_calls", None):
+                            fallback_tool_calls = True
+                        yield chunk
+            except Exception as exc:
+                pipeline_event(
+                    "llm", "error", "Empty-output fallback failed",
+                    "OpenAI fallback failed after an empty primary completion",
+                    event="empty_output_fallback_failed",
+                    provider="openai", error_type=type(exc).__name__, error=str(exc),
+                )
+            finally:
+                await fallback.aclose()
+
+            pipeline_event(
+                "llm",
+                "ok" if fallback_text_length or fallback_tool_calls else "warn",
+                "Empty-output fallback completed",
+                "OpenAI produced a replacement completion" if fallback_text_length else "OpenAI produced no visible replacement text",
+                event="empty_output_fallback_completed",
+                provider="openai",
+                text_present=bool(fallback_text_length),
+                text_length=fallback_text_length,
+                tool_calls_present=fallback_tool_calls,
+            )
+            if not fallback_text_length and not fallback_tool_calls:
+                yield "Sorry, I missed that. Could you say it once more?"
+
+    async def tts_node(self, text, model_settings):
+        """Log the LLM-to-TTS handoff without buffering the speech stream.
+
+        For TTS providers that don't stream natively (Smallest.ai, Rumik,
+        Gemini - Sarvam does and is left on the framework default), chunk at
+        clause boundaries instead of only full sentences - see
+        EagerClauseTokenizer above for why. Native-streaming providers are
+        untouched: they get text pushed straight through, same as before.
+        """
+        async def observed_text():
+            characters = 0
+            logged = False
+            full_text_parts: list[str] = []
+            async for chunk in text:
+                if chunk:
+                    characters += len(chunk)
+                    full_text_parts.append(chunk)
+                    if not logged:
+                        logged = True
+                        pipeline_event(
+                            "tts", "info", "TTS input received",
+                            "Speakable assistant text reached TTS",
+                            event="tts_input_received", characters_count=len(chunk),
+                        )
+                yield chunk
+            if not logged:
+                pipeline_event(
+                    "tts", "warn", "TTS input empty",
+                    "TTS node completed without speakable text",
+                    event="tts_input_empty", characters_count=characters,
+                )
+            # Cheap content heuristic: the mandatory doctor-preference
+            # question is a fixed, prescribed phrase (see BOOK in the system
+            # prompt) - detecting it here lets CallState know it was asked
+            # without needing the LLM to self-report it via a tool call.
+            try:
+                state: CallState = self.session.userdata
+                spoken = "".join(full_text_parts).lower()
+                if "doctor in mind" in spoken or "suggest one" in spoken:
+                    state.doctor_preference_asked = True
+            except Exception:
+                pass
+            # Adaptive VAD: what the agent just said determines how long we
+            # wait for the caller's NEXT turn (spelling/open questions get a
+            # longer window, closed questions stay fast).
+            self._vad_eval("".join(full_text_parts))
+            # Deterministic session end: the LLM speaking its scripted
+            # farewell ends the call even if it skipped the end_call tool.
+            self._maybe_schedule_farewell_hangup("".join(full_text_parts))
+
+        activity = self._get_activity_or_raise()
+        active_tts = activity.tts
+        use_eager_chunking = (
+            env_flag("VOICE_EAGER_TTS_CHUNKING_ENABLED", True)
+            and active_tts is not None
+            and not active_tts.capabilities.streaming
+        )
+        if not use_eager_chunking:
+            async for frame in Agent.default.tts_node(self, observed_text(), model_settings):
+                yield frame
+            return
+
+        wrapped_tts = tts.StreamAdapter(
+            tts=active_tts,
+            sentence_tokenizer=EagerClauseTokenizer(
+                min_chunk_chars=int(os.getenv("TTS_EAGER_MIN_CHUNK_CHARS", "35")),
+                max_chunk_chars=int(os.getenv("TTS_EAGER_MAX_CHUNK_CHARS", "160")),
+                rest_min_chunk_chars=int(os.getenv("TTS_EAGER_REST_MIN_CHARS", "90")),
+            ),
+        )
+        conn_options = self.session.conn_options.tts_conn_options
+        async with wrapped_tts.stream(conn_options=conn_options) as stream:
+
+            async def _forward_input() -> None:
+                async for chunk in observed_text():
+                    stream.push_text(chunk)
+                stream.end_input()
+
+            forward_task = asyncio.create_task(_forward_input())
+            try:
+                async for ev in stream:
+                    yield ev.frame
+            finally:
+                await utils.aio.cancel_and_wait(forward_task)
 
 
 def prewarm_process(proc: JobProcess) -> None:
     try:
         vad_started = time.perf_counter()
+        # 0.3 -> 0.2: measured live (2026-07-14), eou_delay was landing at a
+        # consistent ~1.0-1.16s across a real call even with
+        # MIN_ENDPOINTING_DELAY=0.35 - VAD's own silence-detection wait
+        # STACKS with the endpointing min_delay sequentially (silence
+        # detected -> THEN endpointing sleep starts), not a coincidence.
+        # This trims part of that stack; watch for premature end-of-speech
+        # on naturally paused speech before going lower.
         proc.userdata["vad"] = silero.VAD.load(
-            min_silence_duration=float(os.getenv("VAD_MIN_SILENCE", "0.3"))
+            min_silence_duration=float(os.getenv("VAD_MIN_SILENCE", "0.2"))
         )
         pipeline_event(
             "microphone",
@@ -2439,6 +3560,38 @@ def prewarm_process(proc: JobProcess) -> None:
         )
     except Exception as exc:
         pipeline_event("microphone", "error", "VAD prewarm failed", str(exc), error=exc)
+
+    if env_flag("VOICE_FAQ_CACHE_ENABLED", True) and os.getenv("OPENAI_API_KEY"):
+        try:
+            from openai import AsyncOpenAI
+
+            faq_started = time.perf_counter()
+            client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            # Sourced from the real slot grid, not hardcoded, so the cached
+            # answer can never drift from what callers can actually book.
+            morning = [t for t in db_helper.SLOT_TIMES if t < "13:00"]
+            evening = [t for t in db_helper.SLOT_TIMES if t >= "13:00"]
+            hours_response = (
+                f"We are open Monday to Saturday... morning OPD is {short_time(morning[0])} "
+                f"to {short_time(morning[-1])}, and evening OPD is {short_time(evening[0])} "
+                f"to {short_time(evening[-1])}. We are closed on Sundays."
+            )
+            cache = faq_cache.FaqCache(faq_cache.build_default_entries(hours_response))
+            asyncio.run(cache.warm(client))
+            proc.userdata["faq_cache"] = cache
+            proc.userdata["faq_client"] = client
+            pipeline_event(
+                "llm", "ok", "FAQ cache prewarm",
+                "Static clinic FAQ embeddings ready",
+                duration_ms=round((time.perf_counter() - faq_started) * 1000, 2),
+                entries=len(cache._entries),
+            )
+        except Exception as exc:
+            pipeline_event(
+                "llm", "warn", "FAQ cache prewarm failed",
+                "Worker will run without the FAQ cache; all turns go to the LLM as normal",
+                error=exc, traceback=traceback.format_exc(),
+            )
 
     if KittenLocalTTS is None or not env_flag("KITTEN_TTS_ENABLED", False) or not env_flag("PREWARM_KITTEN_TTS", False):
         return
@@ -2569,35 +3722,61 @@ async def entrypoint(ctx: JobContext):
                 provider=requested_tts_provider,
                 speaker=requested_voice or os.getenv("SARVAM_SPEAKER", "ishita"),
             )
+        
+        # Merge job metadata payload and participant payload, participant overrides job
+        combined_metadata = {}
+        combined_metadata.update(job_metadata_payload)
+        if participant and participant.metadata:
+            try:
+                combined_metadata.update(parse_metadata_json(participant.metadata))
+            except Exception:
+                pass
+                
+        # Extract sliders
+        call_temperature = float(combined_metadata.get("temperature", os.getenv("LLM_TEMPERATURE", "0.1")))
+        call_silence_threshold = float(combined_metadata.get("silence_threshold", os.getenv("MIN_ENDPOINTING_DELAY", "0.5")))
+        call_tts_speed = float(combined_metadata.get("tts_speed", os.getenv("SMALLEST_SPEED", "1.05")))
+        call_stt_min_silence = int(combined_metadata.get("stt_min_silence", os.getenv("ASSEMBLYAI_MIN_TURN_SILENCE", "90")))
+        call_stt_max_silence = int(combined_metadata.get("stt_max_silence", os.getenv("ASSEMBLYAI_MAX_TURN_SILENCE", "320")))
+        call_stt_interruption_delay = int(combined_metadata.get("stt_interruption_delay", os.getenv("ASSEMBLYAI_INTERRUPTION_DELAY", "120")))
 
         preload_task = asyncio.create_task(preload_user(caller_phone))
         pipeline_event("dispatch", "info", "Provider build", "Building STT, LLM, TTS, VAD, and turn detector")
         
         try:
-            stt_provider = build_stt()
+            stt_provider = build_stt(
+                min_turn_silence=call_stt_min_silence,
+                max_turn_silence=call_stt_max_silence,
+                interruption_delay=call_stt_interruption_delay
+            )
         except Exception:
             logger.error("Failed to build STT provider:\n%s", traceback.format_exc())
             raise
 
         try:
-            vad_provider = ctx.proc.userdata.get("vad") or silero.VAD.load(min_silence_duration=float(os.getenv("VAD_MIN_SILENCE", "0.3")))
+            vad_provider = ctx.proc.userdata.get("vad") or silero.VAD.load(min_silence_duration=float(os.getenv("VAD_MIN_SILENCE", "0.2")))
         except Exception:
             logger.error("Failed to load VAD provider:\n%s", traceback.format_exc())
             raise
 
         try:
-            llm_provider = build_llm()
+            llm_provider = build_llm(temperature=call_temperature)
         except Exception:
             logger.error("Failed to build LLM provider:\n%s", traceback.format_exc())
             raise
 
         try:
-            tts_provider = build_tts(tts_provider=requested_tts_provider, voice_id=requested_voice)
+            tts_provider = build_tts(
+                tts_provider=requested_tts_provider, 
+                voice_id=requested_voice, 
+                speed_override=call_tts_speed
+            )
         except Exception:
             logger.error("Failed to build TTS provider:\n%s", traceback.format_exc())
             raise
 
         session = AgentSession(
+            userdata=CallState(),
             stt=stt_provider,
             vad=vad_provider,
             llm=llm_provider,
@@ -2615,10 +3794,10 @@ async def entrypoint(ctx: JobContext):
                 suggest_doctor,
                 end_call,
             ],
-            turn_handling=build_turn_handling(),
+            turn_handling=build_turn_handling(silence_threshold=call_silence_threshold),
             # Keep the built-in markdown/emoji filters and add the JSON/code guard
             # so tool-call leakage from the LLM is never spoken aloud.
-            tts_text_transforms=["filter_markdown", "filter_emoji", filter_code_artifacts, indian_english_phonetic_normalization],
+            tts_text_transforms=["filter_markdown", "filter_emoji", medical_output_guard, filter_code_artifacts, indian_english_phonetic_normalization],
             max_tool_steps=int(os.getenv("MAX_TOOL_STEPS", "3")),
             conn_options=SessionConnectOptions(
                 max_unrecoverable_errors=int(os.getenv("MAX_UNRECOVERABLE_ERRORS", "5"))
@@ -2636,6 +3815,8 @@ async def entrypoint(ctx: JobContext):
             "last_user_activity": time.perf_counter(),
             "last_transcript": time.perf_counter(),
             "last_ping": 0.0,
+            "unanswered_pings": 0,
+            "closing": False,
         }
 
         @session.on("metrics_collected")
@@ -2700,6 +3881,7 @@ async def entrypoint(ctx: JobContext):
             transcript = getattr(ev, "transcript", "")
             is_final = getattr(ev, "is_final", False)
             state_watch["last_transcript"] = time.perf_counter()
+            state_watch["unanswered_pings"] = 0  # the caller is still there
             state_watch["last_user_activity"] = time.perf_counter()
             pipeline_event(
                 "stt",
@@ -2804,6 +3986,8 @@ async def entrypoint(ctx: JobContext):
         agent = GracyAgent(
             instructions="You are a human receptionist for MyStree Clinic. Never call yourself an AI.",
             chat_ctx=build_initial_context(await preload_task),
+            faq_cache_instance=ctx.proc.userdata.get("faq_cache"),
+            faq_client=ctx.proc.userdata.get("faq_client"),
         )
 
         logger.info("Starting AgentSession with cascaded fallback providers.")
@@ -2822,6 +4006,10 @@ async def entrypoint(ctx: JobContext):
             room=ctx.room,
             room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()),
         )
+        if env_flag("VOICE_ADAPTIVE_VAD_ENABLED", True):
+            # Needs a live session (update_options propagates to the running
+            # activity), hence attached here rather than at agent construction.
+            agent._vad_controller = DynamicVADController(session)
         pipeline_event(
             "dispatch",
             "ok",
@@ -2880,6 +4068,10 @@ async def entrypoint(ctx: JobContext):
                     asyncio.create_task(ensure_greeting_cache(active_voice, cache_tts))
             except Exception:
                 logger.warning("Could not schedule greeting cache task", exc_info=True)
+        # The greeting is spoken via say()/cached audio and bypasses
+        # tts_node, so evaluate it explicitly - it asks for the caller's
+        # NAME, exactly the high-cognitive-load case the slow window is for.
+        agent._vad_eval(GREETING_TEXT)
         pipeline_event(
             "tts",
             "ok",
@@ -2899,6 +4091,7 @@ async def entrypoint(ctx: JobContext):
             ping_gap_s = now - state_watch["last_ping"]
             if (
                 env_flag("ENABLE_LINE_LIVE_CHECK", True)
+                and not state_watch["closing"]
                 and state_watch["agent"] == "listening"
                 and state_watch["user"] != "speaking"
                 # A queued/active agent speech means we are not actually idle
@@ -2909,10 +4102,34 @@ async def entrypoint(ctx: JobContext):
                 and ping_gap_s > float(os.getenv("LINE_LIVE_CHECK_COOLDOWN_SECONDS", "30.0"))
             ):
                 state_watch["last_ping"] = now
-                phrase = os.getenv(
-                    "LINE_LIVE_CHECK_TEXT",
-                    "Take your time... I am right here whenever you're ready.",
-                )
+                state_watch["unanswered_pings"] += 1
+                # Auto-close after repeated unanswered check-ins. Previously
+                # this loop pinged "Are you still there?" every 30s forever -
+                # a caller who walked away left a zombie call running until
+                # something else killed it. Two unanswered checks (~45s+ of
+                # total silence) is a finished conversation.
+                if state_watch["unanswered_pings"] > int(os.getenv("LINE_LIVE_MAX_UNANSWERED", "2")):
+                    state_watch["closing"] = True
+                    pipeline_event(
+                        "worker", "warn", "Silence auto-close",
+                        "No response after repeated check-ins; ending the call",
+                        event="silence_auto_close",
+                        unanswered_pings=state_watch["unanswered_pings"],
+                        silence_s=round(silence_s, 2),
+                    )
+                    try:
+                        await session.say(
+                            "It seems the line has gone quiet... I will end the call now. "
+                            "Please call back anytime. " + GOODBYE_TEXT,
+                            allow_interruptions=True,
+                        )
+                    except Exception:
+                        pass  # dead session - the hangup below still runs
+                    schedule_hangup_after_playout(session)
+                    continue  # loop exits naturally when the room disconnects
+                # Short on purpose - a long check-in phrase is more likely to
+                # collide with a caller who starts speaking mid-playback.
+                phrase = os.getenv("LINE_LIVE_CHECK_TEXT", "Are you still there?")
                 pipeline_event(
                     "turn",
                     "warn",
@@ -2924,7 +4141,7 @@ async def entrypoint(ctx: JobContext):
                 )
                 try:
                     await session.say(phrase, allow_interruptions=True)
-                except Exception:
+                except Exception as exc:
                     pipeline_event(
                         "turn",
                         "warn",
@@ -2932,6 +4149,23 @@ async def entrypoint(ctx: JobContext):
                         "Unable to speak line-is-live prompt",
                         traceback=traceback.format_exc(),
                     )
+                    # Observed live: the room's connection_state can keep
+                    # reporting CONN_CONNECTED for 10+ seconds after the
+                    # WebRTC data channels have already died (caller's
+                    # network/tab dropped without a clean disconnect), which
+                    # this loop's own exit condition never catches. Once the
+                    # AgentSession itself has stopped, every subsequent
+                    # session.say() anywhere in the call - fast path, FAQ
+                    # cache, normal LLM replies - fails the same way, so the
+                    # caller hears nothing for the rest of the "call" while
+                    # the worker spins here every 30s forever. Treat this
+                    # specific error as a hard signal to end the call now.
+                    if "isn't running" in str(exc) or "is not running" in str(exc):
+                        pipeline_event(
+                            "webrtc", "error", "AgentSession died unexpectedly",
+                            "Session stopped running while the room still reported connected; ending the call now",
+                        )
+                        break
 
         slot_cache.stop()
         logger.info("Room disconnected, ending agent task.")

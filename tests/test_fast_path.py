@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agent import fast_path_reply  # noqa: E402
+from agent import assemble_spelled_name, fast_path_reply, looks_incomplete  # noqa: E402
 
 PHONE_PROMPT = "Thank you... and the best mobile number to reach you on?"
 NAME_PROMPT = "Namaste... may I have your name, please?"
@@ -62,6 +62,82 @@ for text in [
 result = fast_path_reply("7012812476", PHONE_PROMPT)
 check("phone reply is digit-by-digit", result is not None and "7-0-1-2-8-1-2-4-7-6" in result[1])
 
+# --- positive: deterministic name collection and incomplete-turn guard -----
+for text in [
+    "My name is Dylan",
+    "My name it Tilin",
+    "My names Tilin",
+    "My name's Tilin",
+    "This is Asha",
+    "I am Tilin",
+    "I'm Tilin",
+    "Tilin",
+]:
+    result = fast_path_reply(text, NAME_PROMPT)
+    check(f"name fires: {text!r}", result is not None and result[0] == "name_captured")
+
+for text in ["My name is Tilin", "My name it Tilin", "My names Tilin"]:
+    result = fast_path_reply(text, NAME_PROMPT)
+    check(
+        f"name introduction removed: {text!r}",
+        result == ("name_captured", "Thanks, Tilin. May I have your phone number?"),
+    )
+
+for text in ["My name is.", "My number is", "I want to..."]:
+    result = fast_path_reply(text, NAME_PROMPT)
+    check(f"incomplete waits: {text!r}", result is not None and result[0] == "incomplete")
+    check(f"incomplete detector: {text!r}", looks_incomplete(text))
+
+# --- positive: spelled-out names reassembled deterministically --------------
+SPELL_PROMPT = "Sorry, could you spell that for me, one letter at a time?"
+for text, expected in [
+    ("P R I Y A", "Priya"),
+    ("P, R, I, Y, A", "Priya"),
+    ("p as in papa, r as in romeo, i as in india, y as in yankee, a as in alpha", "Priya"),
+    ("A Y E S H A", "Ayesha"),
+    ("yeah it's spelled T I L I N", "Tilin"),
+    ("N double E T A", "Neeta"),
+]:
+    check(f"assembler: {text!r} -> {expected}", assemble_spelled_name(text) == expected)
+    result = fast_path_reply(text, SPELL_PROMPT)
+    check(
+        f"spelled name fires after spell prompt: {text!r}",
+        result is not None and result[0] == "name_captured" and expected in result[1],
+    )
+
+# ordinary sentences must NOT be mistaken for spellings
+for text in [
+    "I want to book an appointment",
+    "yes that works",
+    "my name is Priya",
+    "a b",  # too short to be a spelling
+]:
+    check(f"assembler rejects: {text!r}", assemble_spelled_name(text) is None)
+
+# --- negative: things that must NEVER be captured as a patient name ---------
+# "Hello? Are you there?" was captured as a name on a live call - every one of
+# these must fall through to the LLM (result is None), never "name_captured".
+for text in [
+    "Hello?",
+    "Hello? Are you there?",
+    "Are you there?",
+    "Are you there",
+    "Can you hear me?",
+    "Can you hear me",
+    "Yeah",
+    "Correct",
+    "Tomorrow",
+    "Appointment",
+    "Doctor",
+    "Thank you",
+    "Nothing",
+]:
+    result = fast_path_reply(text, NAME_PROMPT)
+    check(
+        f"never a name: {text!r}",
+        result is None or result[0] != "name_captured",
+    )
+
 # --- negative: must NOT fire ------------------------------------------------
 negatives = [
     # bare yes/no is state-dependent - must go to the LLM
@@ -85,7 +161,6 @@ negatives = [
     # normal conversational turns
     ("I want to book an appointment", ""),
     ("tomorrow evening", "Which day works for you?"),
-    ("Tilin", NAME_PROMPT),
 ]
 for text, prompt in negatives:
     result = fast_path_reply(text, prompt)
